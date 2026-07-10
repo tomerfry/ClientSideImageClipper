@@ -22,6 +22,12 @@ WebAssembly). No server, no uploads: a static site deployable to GitHub Pages.
    from its source, so it never compounds). Works on a finished cut — or
    directly on the imported image if you haven't cut anything yet, which
    is handy for cleaning up pasted cutouts that still carry junk.
+5. **Smooth outline** — press `S` (or drag the *smooth* slider): rounds
+   jagged, stair-stepped cutout boundaries while keeping a crisp ~1px
+   anti-aliased edge. The object's colours are first extended outward
+   (distance transform), so the reshaped edge never shows a dark fringe.
+   Slider position is a live, non-destructive setting — 0 restores the
+   original edge.
 
 ## How the "magic" works
 
@@ -48,6 +54,7 @@ mapped back to full resolution for the final cut).
 | straight (non-snapping) segment | `Alt` + click |
 | close path & cut | double-click / `Enter` / click first anchor |
 | auto-trim leftover background | `B` or *trim bg* button |
+| smooth cutout outline | `S` or the *smooth* slider |
 | undo last anchor | `Backspace` |
 | discard path | `Esc` |
 | zoom / pan | wheel / `Space`+drag or middle-drag |

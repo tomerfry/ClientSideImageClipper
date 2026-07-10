@@ -29,6 +29,7 @@ const els = {
   open: $('btn-open'), paste: $('btn-paste'), undo: $('btn-undo'), reset: $('btn-reset'),
   cut: $('btn-cut'), fit: $('btn-fit'), download: $('btn-download'), copy: $('btn-copy'),
   trim: $('btn-trim'), tol: $('tol'), tolVal: $('tol-val'),
+  smooth: $('smooth'), smoothVal: $('smooth-val'),
 };
 const ctx = els.canvas.getContext('2d');
 const reducedMotion = matchMedia('(prefers-reduced-motion: reduce)').matches;
@@ -51,9 +52,10 @@ const state = {
   livePath: null,              // Int32Array, current seed -> cursor
   closed: false,
 
-  cutout: null,                // {blob, url, w, h, srcCanvas, trimmed}
+  cutout: null,                // {blob, url, w, h, srcCanvas, baseCanvas, trimmed, smoothed}
   trimSrc: null,               // canvas the in-flight/last trim derives from
-  trimBusy: false,
+  smoothBase: null,            // canvas the in-flight smooth derives from
+  trimBusy: false, smoothBusy: false,
   spaceDown: false, pan: null,
 };
 
@@ -109,6 +111,17 @@ worker.onmessage = (e) => {
         break;
       }
       applyTrimmed(m);
+      break;
+
+    case 'smoothed':
+      state.smoothBusy = false;
+      hideBusy();
+      if (!state.smoothBase) break;
+      if (!m.width || !m.height) {
+        setStatus('ready', 'smoothing removed everything — lower the smooth value');
+        break;
+      }
+      applySmoothed(m);
       break;
 
     case 'error':
@@ -259,6 +272,7 @@ function clearCutout() {
   if (state.cutout) URL.revokeObjectURL(state.cutout.url);
   state.cutout = null;
   state.trimSrc = null;
+  state.smoothBase = null;
   els.resultImg.style.display = 'none';
   els.resultImg.removeAttribute('src');
   els.resultPlaceholder.style.display = 'block';
@@ -499,6 +513,13 @@ window.addEventListener('keydown', (e) => {
     e.preventDefault();
   }
   else if (e.key === 'b' || e.key === 'B') requestTrim();
+  else if (e.key === 's' || e.key === 'S') {
+    if (Number(els.smooth.value) === 0) {
+      els.smooth.value = '4';               // sensible default on first press
+      els.smoothVal.textContent = '4';
+    }
+    requestSmooth();
+  }
   else if (e.key === 'Escape') resetPath();
   else if (e.key === 'Backspace' || e.key === 'Delete') { e.preventDefault(); undoAnchor(); }
   else if (e.key === 'Enter') requestClose();
@@ -674,18 +695,21 @@ function buildCutout() {
   octx.globalCompositeOperation = 'source-in';   // keep image only inside it
   octx.drawImage(state.bitmap, 0, 0);
 
-  publishCutout(oc, oc, false);
+  publishCutout(oc, { srcCanvas: oc, baseCanvas: oc, trimmed: false, smoothed: 0 });
+  if (Number(els.smooth.value) > 0) requestSmooth(oc); // slider is a persistent setting
 }
 
-function publishCutout(canvas, srcCanvas, trimmed) {
+function publishCutout(canvas, opts) {
   canvas.toBlob((blob) => {
     if (!blob) return;
     if (state.cutout) URL.revokeObjectURL(state.cutout.url);
     state.cutout = {
       blob, url: URL.createObjectURL(blob),
       w: canvas.width, h: canvas.height,
-      srcCanvas,          // untrimmed original — trims always re-derive from it
-      trimmed,
+      srcCanvas: opts.srcCanvas,    // original cut — trims re-derive from it
+      baseCanvas: opts.baseCanvas,  // post-trim — smoothing re-derives from it
+      trimmed: opts.trimmed,
+      smoothed: opts.smoothed,
     };
     els.resultImg.src = state.cutout.url;
     els.resultImg.style.display = 'block';
@@ -693,10 +717,13 @@ function publishCutout(canvas, srcCanvas, trimmed) {
     els.resultMeta.innerHTML =
       `cutout <span class="num">${canvas.width}</span>×<span class="num">${canvas.height}</span>px · ` +
       `<span class="num">${(blob.size / 1024).toFixed(0)}</span> kb png` +
-      (trimmed ? ` · trimmed @ tol <span class="num">${els.tol.value}</span>` : '');
-    setStatus('ready', trimmed
-      ? 'background trimmed — adjust tolerance to re-trim from the original cut'
-      : 'region cut — press space or “trim bg” to drop leftover background');
+      (opts.trimmed ? ` · trimmed @ tol <span class="num">${els.tol.value}</span>` : '') +
+      (opts.smoothed ? ` · smoothed @ <span class="num">${opts.smoothed}</span>` : '');
+    setStatus('ready', opts.smoothed
+      ? 'outline smoothed — the slider re-smooths non-destructively'
+      : opts.trimmed
+        ? 'background trimmed — adjust tolerance to re-trim from the original cut'
+        : 'region cut — b trims background, s smooths the outline');
     updateUi();
   }, 'image/png');
 }
@@ -732,12 +759,67 @@ function applyTrimmed(m) {
   c.width = m.width;
   c.height = m.height;
   c.getContext('2d').putImageData(new ImageData(m.rgba, m.width, m.height), 0, 0);
-  publishCutout(c, state.trimSrc, true);
+  publishCutout(c, { srcCanvas: state.trimSrc, baseCanvas: c, trimmed: true, smoothed: 0 });
+  if (Number(els.smooth.value) > 0) requestSmooth(c); // keep the smooth setting applied
+}
+
+/* ── outline smoothing (s / slider) ────────────────────────────── */
+
+function wholeImageCanvas() {
+  if (!state.bitmap) return null;
+  const c = document.createElement('canvas');
+  c.width = state.fullW;
+  c.height = state.fullH;
+  c.getContext('2d').drawImage(state.bitmap, 0, 0);
+  return c;
+}
+
+function requestSmooth(baseOverride) {
+  if (state.trimBusy || state.smoothBusy || !state.engineReady) return;
+  const base = baseOverride || (state.cutout ? state.cutout.baseCanvas : wholeImageCanvas());
+  if (!base) {
+    setStatus('ready', 'load an image or cut a region first — nothing to smooth');
+    return;
+  }
+  const amount = Number(els.smooth.value);
+  if (amount <= 0) {
+    // un-smooth: republish the base as-is
+    if (state.cutout) {
+      publishCutout(base, {
+        srcCanvas: state.cutout.srcCanvas, baseCanvas: base,
+        trimmed: state.cutout.trimmed, smoothed: 0,
+      });
+    }
+    return;
+  }
+  state.smoothBase = base;
+  const data = base.getContext('2d').getImageData(0, 0, base.width, base.height).data;
+  state.smoothBusy = true;
+  showBusy('smoothing outline…');
+  worker.postMessage(
+    { type: 'smooth', rgba: data, width: base.width, height: base.height, amount },
+    [data.buffer]
+  );
+}
+
+function applySmoothed(m) {
+  const c = document.createElement('canvas');
+  c.width = m.width;
+  c.height = m.height;
+  c.getContext('2d').putImageData(new ImageData(m.rgba, m.width, m.height), 0, 0);
+  publishCutout(c, {
+    srcCanvas: state.cutout ? state.cutout.srcCanvas : state.smoothBase,
+    baseCanvas: state.smoothBase,
+    trimmed: state.cutout ? state.cutout.trimmed : false,
+    smoothed: Number(els.smooth.value),
+  });
 }
 
 els.trim.addEventListener('click', requestTrim);
 els.tol.addEventListener('input', () => { els.tolVal.textContent = els.tol.value; });
 els.tol.addEventListener('change', () => requestTrim());
+els.smooth.addEventListener('input', () => { els.smoothVal.textContent = els.smooth.value; });
+els.smooth.addEventListener('change', () => requestSmooth());
 
 els.download.addEventListener('click', () => {
   if (!state.cutout) return;

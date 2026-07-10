@@ -190,6 +190,14 @@ def trim_cutout(rgba, width, height, tolerance):
         a[..., 3][np.isin(lab2, small)] = 0
         solid = a[..., 3] > 0
 
+    return _crop_to_content(a)
+
+
+def _crop_to_content(a):
+    """Crop an RGBA array to its alpha>0 bounding box (+1px pad) and
+    return the (bytes, x, y, w, h) tuple the worker protocol expects."""
+    height, width = a.shape[:2]
+    solid = a[..., 3] > 0
     if not solid.any():
         return (b"", 0, 0, 0, 0)
     ys, xs = np.nonzero(solid)
@@ -199,6 +207,48 @@ def trim_cutout(rgba, width, height, tolerance):
     y1 = min(height, int(ys.max()) + 2)
     crop = np.ascontiguousarray(a[y0:y1, x0:x1])
     return (crop.tobytes(), x0, y0, x1 - x0, y1 - y0)
+
+
+def smooth_edges(rgba, width, height, amount):
+    """Smooth a cutout's outline: round jagged, stair-stepped alpha
+    boundaries while keeping the edge crisp (~1px anti-aliased ramp).
+
+    Method: extend the object's colours into transparent pixels (nearest
+    opaque pixel via distance transform, so the reshaped edge never shows
+    a dark fringe), Gaussian-blur the alpha channel, then re-steepen the
+    ramp around 0.5 — a blur-and-sharpen contour smoothing, like
+    Photoshop's mask "Smooth".
+
+    `amount` is the UI slider value (1..10). Returns the standard
+    (rgba_bytes, x, y, w, h) crop tuple.
+    """
+    width = int(width)
+    height = int(height)
+    a = np.frombuffer(_as_bytes_like(rgba), dtype=np.uint8) \
+          .reshape(height, width, 4).copy()
+    sigma = 0.3 + 0.4 * float(amount)
+    alpha = a[..., 3].astype(np.float32) / 255.0
+    if amount <= 0 or not (alpha > 0).any():
+        return _crop_to_content(a)
+
+    # pad so the reshaped contour can move past the original bounds
+    p = int(np.ceil(sigma)) + 2
+    a = np.pad(a, ((p, p), (p, p), (0, 0)))
+    alpha = np.pad(alpha, p)
+
+    solid = alpha > 0.25
+    if solid.any() and (~solid).any():
+        ind = ndimage.distance_transform_edt(
+            ~solid, return_distances=False, return_indices=True
+        )
+        a[..., :3] = a[..., :3][ind[0], ind[1]]
+
+    blurred = ndimage.gaussian_filter(alpha, sigma)
+    steep = max(1.6, 2.1 * sigma)  # keep the final edge ~1px wide
+    out = np.clip((blurred - 0.5) * steep + 0.5, 0.0, 1.0)
+    a[..., 3] = (out * 255.0 + 0.5).astype(np.uint8)
+    data, x0, y0, w, h = _crop_to_content(a)
+    return (data, x0 - p, y0 - p, w, h)
 
 
 def get_path(x, y):

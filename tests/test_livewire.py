@@ -98,6 +98,44 @@ def test_trim_cutout_removes_background_and_specks():
     print(f"  trim: interior bg-coloured region preserved ({bright.sum()} px)")
 
 
+def test_smooth_edges_rounds_jaggies_without_fringe():
+    """A disk with a deliberately ragged 1-2px boundary: smoothing must
+    shorten the contour (fewer jaggies), roughly preserve area, and the
+    anti-aliased edge pixels must keep the object's colour (no dark
+    fringe from transparent-black neighbours)."""
+    from scipy import ndimage
+    w = h = 160
+    yy, xx = np.mgrid[0:h, 0:w]
+    rng = np.random.default_rng(3)
+    wobble = rng.integers(-2, 3, size=(h, w))          # ragged boundary
+    disk = (np.hypot(xx - 80, yy - 80) + wobble) < 50
+    img = np.zeros((h, w, 4), np.uint8)
+    img[disk] = (250, 120, 30, 255)                     # orange on transparent
+
+    def contour_len(alpha):
+        s = alpha > 128
+        return (s[:, 1:] != s[:, :-1]).sum() + (s[1:, :] != s[:-1, :]).sum()
+
+    len_before = contour_len(img[..., 3])
+    area_before = (img[..., 3] > 128).sum()
+
+    data, x0, y0, cw, ch = livewire.smooth_edges(img.reshape(-1), w, h, 5)
+    out = np.frombuffer(data, np.uint8).reshape(ch, cw, 4)
+    len_after = contour_len(out[..., 3])
+    area_after = (out[..., 3] > 128).sum()
+    print(f"  smooth: contour {len_before} -> {len_after} transitions, "
+          f"area {area_before} -> {area_after}")
+    assert len_after < 0.9 * len_before, "outline did not get smoother"
+    assert abs(area_after - area_before) < 0.1 * area_before, "area drifted too much"
+
+    semi = (out[..., 3] > 30) & (out[..., 3] < 225)
+    assert semi.sum() > 50, "expected an anti-aliased edge band"
+    edge_rgb = out[..., :3][semi].astype(float).mean(axis=0)
+    print(f"  smooth: {semi.sum()} AA edge px, mean colour {edge_rgb.round(0)}")
+    assert abs(edge_rgb[0] - 250) < 25 and abs(edge_rgb[2] - 30) < 25, \
+        f"edge colour bled: {edge_rgb}"
+
+
 def bench_browser_resolution():
     """Timing at the app's working resolution (WORK_MAX=768). The browser
     (WASM) is roughly 2-3x slower than native — keep an eye on these."""
@@ -128,6 +166,8 @@ if __name__ == "__main__":
     test_flat_image_gives_straight_path()
     print("test_trim_cutout_removes_background_and_specks")
     test_trim_cutout_removes_background_and_specks()
+    print("test_smooth_edges_rounds_jaggies_without_fringe")
+    test_smooth_edges_rounds_jaggies_without_fringe()
     print("bench_browser_resolution")
     bench_browser_resolution()
     print("OK — all livewire tests passed")
