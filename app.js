@@ -52,6 +52,7 @@ const state = {
   closed: false,
 
   cutout: null,                // {blob, url, w, h, srcCanvas, trimmed}
+  trimSrc: null,               // canvas the in-flight/last trim derives from
   trimBusy: false,
   spaceDown: false, pan: null,
 };
@@ -84,7 +85,7 @@ worker.onmessage = (e) => {
       state.graphBusy = false;
       state.imageReady = true;
       hideBusy();
-      setStatus('ready', 'ready — click an outline to start clipping');
+      setStatus('ready', 'ready — click an outline to clip, or press b to auto-trim the whole image');
       updateUi();
       break;
 
@@ -102,7 +103,7 @@ worker.onmessage = (e) => {
     case 'trimmed':
       state.trimBusy = false;
       hideBusy();
-      if (!state.cutout) break;
+      if (!state.trimSrc) break;
       if (!m.width || !m.height) {
         setStatus('ready', 'trim removed everything — lower the tolerance and retry');
         break;
@@ -204,7 +205,7 @@ function updateUi() {
   els.fit.disabled = !state.bitmap;
   els.download.disabled = !state.cutout;
   els.copy.disabled = !state.cutout || typeof ClipboardItem === 'undefined';
-  els.trim.disabled = !state.cutout || !state.engineReady;
+  els.trim.disabled = !state.engineReady || (!state.cutout && !state.bitmap);
 }
 
 /* ── image loading ─────────────────────────────────────────────── */
@@ -222,6 +223,7 @@ async function loadImageBlob(blob) {
     }
   }
   resetPath();
+  clearCutout();
   state.bitmap = bitmap;
   state.fullW = bitmap.width;
   state.fullH = bitmap.height;
@@ -251,6 +253,17 @@ async function loadImageBlob(blob) {
     state.pendingImage = payload;
     showBusy('waiting for python engine…');
   }
+}
+
+function clearCutout() {
+  if (state.cutout) URL.revokeObjectURL(state.cutout.url);
+  state.cutout = null;
+  state.trimSrc = null;
+  els.resultImg.style.display = 'none';
+  els.resultImg.removeAttribute('src');
+  els.resultPlaceholder.style.display = 'block';
+  els.resultMeta.textContent = '';
+  updateUi();
 }
 
 function postImage(p) {
@@ -691,8 +704,20 @@ function publishCutout(canvas, srcCanvas, trimmed) {
 /* ── auto-trim (space / panel button) ──────────────────────────── */
 
 function requestTrim() {
-  if (!state.cutout || state.trimBusy || !state.engineReady) return;
-  const src = state.cutout.srcCanvas;
+  if (state.trimBusy || !state.engineReady) return;
+  let src = state.cutout ? state.cutout.srcCanvas : null;
+  if (!src) {
+    if (!state.bitmap) {
+      setStatus('ready', 'load an image first — trim needs something to work on');
+      return;
+    }
+    // no cut yet: trim the whole imported image
+    src = document.createElement('canvas');
+    src.width = state.fullW;
+    src.height = state.fullH;
+    src.getContext('2d').drawImage(state.bitmap, 0, 0);
+  }
+  state.trimSrc = src;
   const data = src.getContext('2d').getImageData(0, 0, src.width, src.height).data;
   state.trimBusy = true;
   showBusy('trimming background…');
@@ -707,7 +732,7 @@ function applyTrimmed(m) {
   c.width = m.width;
   c.height = m.height;
   c.getContext('2d').putImageData(new ImageData(m.rgba, m.width, m.height), 0, 0);
-  publishCutout(c, state.cutout.srcCanvas, true);
+  publishCutout(c, state.trimSrc, true);
 }
 
 els.trim.addEventListener('click', requestTrim);

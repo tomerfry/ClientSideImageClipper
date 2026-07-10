@@ -15,11 +15,13 @@ WebAssembly). No server, no uploads: a static site deployable to GitHub Pages.
    anchor) to get an antialiased, transparent-background PNG you can
    download or copy straight to the clipboard.
 4. **Auto-trim** — press `B` (or the *trim bg* button): background-
-   coloured areas reachable from the cutout's outer edge become
-   transparent, stray disconnected specks are dropped, and the canvas is
-   cropped tight to the subject (scipy connected-component labelling; the
-   tolerance slider controls how aggressive the colour match is; every
-   trim re-derives from the original cut, so it never compounds).
+   coloured areas reachable from the outer edge become transparent, stray
+   disconnected specks are dropped, and the canvas is cropped tight to
+   the subject (scipy connected-component labelling; the tolerance slider
+   controls how aggressive the colour match is; every trim re-derives
+   from its source, so it never compounds). Works on a finished cut — or
+   directly on the imported image if you haven't cut anything yet, which
+   is handy for cleaning up pasted cutouts that still carry junk.
 
 ## How the "magic" works
 
