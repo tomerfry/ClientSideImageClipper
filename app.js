@@ -28,6 +28,7 @@ const els = {
   resultImg: $('result-img'), resultPlaceholder: $('result-placeholder'), resultMeta: $('result-meta'),
   open: $('btn-open'), paste: $('btn-paste'), undo: $('btn-undo'), reset: $('btn-reset'),
   cut: $('btn-cut'), fit: $('btn-fit'), download: $('btn-download'), copy: $('btn-copy'),
+  trim: $('btn-trim'), tol: $('tol'), tolVal: $('tol-val'),
 };
 const ctx = els.canvas.getContext('2d');
 const reducedMotion = matchMedia('(prefers-reduced-motion: reduce)').matches;
@@ -50,8 +51,9 @@ const state = {
   livePath: null,              // Int32Array, current seed -> cursor
   closed: false,
 
-  cutout: null,                // {blob, url, w, h}
-  spaceDown: false, pan: null,
+  cutout: null,                // {blob, url, w, h, srcCanvas, trimmed}
+  trimBusy: false,
+  spaceDown: false, spacePanned: false, pan: null,
 };
 
 /* ── worker wiring ─────────────────────────────────────────────── */
@@ -95,6 +97,17 @@ worker.onmessage = (e) => {
 
     case 'path':
       onPathReply(m.token, m.points);
+      break;
+
+    case 'trimmed':
+      state.trimBusy = false;
+      hideBusy();
+      if (!state.cutout) break;
+      if (!m.width || !m.height) {
+        setStatus('ready', 'trim removed everything — lower the tolerance and retry');
+        break;
+      }
+      applyTrimmed(m);
       break;
 
     case 'error':
@@ -191,6 +204,7 @@ function updateUi() {
   els.fit.disabled = !state.bitmap;
   els.download.disabled = !state.cutout;
   els.copy.disabled = !state.cutout || typeof ClipboardItem === 'undefined';
+  els.trim.disabled = !state.cutout || !state.engineReady;
 }
 
 /* ── image loading ─────────────────────────────────────────────── */
@@ -351,6 +365,7 @@ function screenDist(e, workPt) {
 els.canvas.addEventListener('pointerdown', (e) => {
   if (e.button === 1 || (e.button === 0 && state.spaceDown)) {
     e.preventDefault();
+    state.spacePanned = true;
     state.pan = { sx: e.clientX, sy: e.clientY, tx: state.view.tx, ty: state.view.ty };
     els.canvas.classList.add('pan-active');
     els.canvas.setPointerCapture(e.pointerId);
@@ -464,7 +479,14 @@ els.cut.addEventListener('click', requestClose);
 els.fit.addEventListener('click', fitView);
 
 window.addEventListener('keydown', (e) => {
-  if (e.code === 'Space') { state.spaceDown = true; els.canvas.classList.add('panning'); e.preventDefault(); }
+  const tag = e.target && e.target.tagName;
+  if (tag === 'BUTTON' || tag === 'INPUT') return; // let native control keys work
+  if (e.code === 'Space') {
+    if (!e.repeat) state.spacePanned = false;
+    state.spaceDown = true;
+    els.canvas.classList.add('panning');
+    e.preventDefault();
+  }
   else if (e.key === 'Escape') resetPath();
   else if (e.key === 'Backspace' || e.key === 'Delete') { e.preventDefault(); undoAnchor(); }
   else if (e.key === 'Enter') requestClose();
@@ -472,7 +494,11 @@ window.addEventListener('keydown', (e) => {
   else if (e.key === 'o' || e.key === 'O') els.fileInput.click();
 });
 window.addEventListener('keyup', (e) => {
-  if (e.code === 'Space') { state.spaceDown = false; els.canvas.classList.remove('panning'); }
+  if (e.code === 'Space') {
+    state.spaceDown = false;
+    els.canvas.classList.remove('panning');
+    if (!state.spacePanned && state.cutout) requestTrim(); // tap = trim, hold+drag = pan
+  }
 });
 
 /* ── rendering ─────────────────────────────────────────────────── */
@@ -637,20 +663,58 @@ function buildCutout() {
   octx.globalCompositeOperation = 'source-in';   // keep image only inside it
   octx.drawImage(state.bitmap, 0, 0);
 
-  oc.toBlob((blob) => {
+  publishCutout(oc, oc, false);
+}
+
+function publishCutout(canvas, srcCanvas, trimmed) {
+  canvas.toBlob((blob) => {
     if (!blob) return;
     if (state.cutout) URL.revokeObjectURL(state.cutout.url);
-    state.cutout = { blob, url: URL.createObjectURL(blob), w, h };
+    state.cutout = {
+      blob, url: URL.createObjectURL(blob),
+      w: canvas.width, h: canvas.height,
+      srcCanvas,          // untrimmed original — trims always re-derive from it
+      trimmed,
+    };
     els.resultImg.src = state.cutout.url;
     els.resultImg.style.display = 'block';
     els.resultPlaceholder.style.display = 'none';
     els.resultMeta.innerHTML =
-      `cutout <span class="num">${w}</span>×<span class="num">${h}</span>px · ` +
-      `<span class="num">${(blob.size / 1024).toFixed(0)}</span> kb png`;
-    setStatus('ready', 'region cut — download or copy it, esc to start a new selection');
+      `cutout <span class="num">${canvas.width}</span>×<span class="num">${canvas.height}</span>px · ` +
+      `<span class="num">${(blob.size / 1024).toFixed(0)}</span> kb png` +
+      (trimmed ? ` · trimmed @ tol <span class="num">${els.tol.value}</span>` : '');
+    setStatus('ready', trimmed
+      ? 'background trimmed — adjust tolerance to re-trim from the original cut'
+      : 'region cut — press space or “trim bg” to drop leftover background');
     updateUi();
   }, 'image/png');
 }
+
+/* ── auto-trim (space / panel button) ──────────────────────────── */
+
+function requestTrim() {
+  if (!state.cutout || state.trimBusy || !state.engineReady) return;
+  const src = state.cutout.srcCanvas;
+  const data = src.getContext('2d').getImageData(0, 0, src.width, src.height).data;
+  state.trimBusy = true;
+  showBusy('trimming background…');
+  worker.postMessage(
+    { type: 'trim', rgba: data, width: src.width, height: src.height, tolerance: Number(els.tol.value) },
+    [data.buffer]
+  );
+}
+
+function applyTrimmed(m) {
+  const c = document.createElement('canvas');
+  c.width = m.width;
+  c.height = m.height;
+  c.getContext('2d').putImageData(new ImageData(m.rgba, m.width, m.height), 0, 0);
+  publishCutout(c, state.cutout.srcCanvas, true);
+}
+
+els.trim.addEventListener('click', requestTrim);
+els.tol.addEventListener('input', () => { els.tolVal.textContent = els.tol.value; });
+els.tol.addEventListener('change', () => requestTrim());
 
 els.download.addEventListener('click', () => {
   if (!state.cutout) return;

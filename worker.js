@@ -71,6 +71,18 @@ self.onmessage = (e) => {
       }
       break;
 
+    case 'trim':
+      try {
+        const proxy = livewire.trim_cutout(m.rgba, m.width, m.height, m.tolerance);
+        const [buf, x, y, width, height] = proxy.toJs();
+        proxy.destroy();
+        const rgba = new Uint8ClampedArray(buf && buf.length ? buf : 0);
+        post({ type: 'trimmed', rgba, width, height, x, y }, [rgba.buffer]);
+      } catch (err) {
+        fail('trim', err);
+      }
+      break;
+
     case 'path':
       try {
         const proxy = livewire.get_path(m.x, m.y);

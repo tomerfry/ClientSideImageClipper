@@ -161,6 +161,9 @@
   #result-meta .num { color: var(--purple); font-variant-numeric: tabular-nums; }
   .row { display: flex; gap: .4rem; }
   .row button { flex: 1; }
+  .tol-row { display: flex; align-items: center; gap: .5rem; color: var(--comment); font-size: .85rem; }
+  .tol-row input[type=range] { flex: 1; accent-color: var(--pink); min-width: 0; }
+  .tol-row #tol-val { color: var(--purple); min-width: 3ch; text-align: right; font-variant-numeric: tabular-nums; }
   .hints { list-style: none; display: flex; flex-direction: column; gap: .45rem; color: var(--fg-dim); font-size: .85rem; }
   .hints li::before { content: "› "; color: var(--pink); }
   .hints kbd { white-space: nowrap; }
@@ -233,6 +236,16 @@
       <img id="result-img" alt="clipped result">
     </div>
     <div class="row">
+      <button id="btn-trim" class="accent" disabled
+        title="Auto-remove leftover background reachable from the cutout's edge, drop stray specks, and tighten the crop (Space)">✂ trim bg</button>
+    </div>
+    <div class="tol-row">
+      <label for="tol">tolerance</label>
+      <input type="range" id="tol" min="4" max="120" value="28"
+        title="How far from the background colour a pixel may be and still get trimmed">
+      <span id="tol-val">28</span>
+    </div>
+    <div class="row">
       <button id="btn-download" class="good" disabled>download png</button>
       <button id="btn-copy" disabled>copy</button>
     </div>
@@ -245,6 +258,7 @@
       <li><b>click</b> again to pin the snapped segment</li>
       <li><kbd>alt</kbd>+click = straight segment (no snap)</li>
       <li><b>double-click</b> / <kbd>enter</kbd> / click the first anchor = close &amp; cut</li>
+      <li><kbd>space</kbd> / <b>trim bg</b> = auto-remove leftover background around the subject + tighten the crop</li>
       <li><kbd>backspace</kbd> undo · <kbd>esc</kbd> reset</li>
       <li><b>wheel</b> zoom · <kbd>space</kbd>+drag / middle-drag pan</li>
     </ul>
@@ -256,7 +270,7 @@
   <span id="status-text">booting python engine…</span>
   <span id="img-info"></span>
   <span class="spacer"></span>
-  <span class="keys">click add · dblclick close · alt straight · ⌫ undo · esc reset · wheel zoom · space pan</span>
+  <span class="keys">click add · dblclick close · alt straight · space trim · ⌫ undo · esc reset · wheel zoom · space+drag pan</span>
 </footer>
 
 <input type="file" id="file-input" accept="image/*" hidden>

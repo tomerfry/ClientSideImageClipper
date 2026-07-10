@@ -14,6 +14,12 @@ WebAssembly). No server, no uploads: a static site deployable to GitHub Pages.
 3. **Cut** — close the path (double-click / `Enter` / click the first
    anchor) to get an antialiased, transparent-background PNG you can
    download or copy straight to the clipboard.
+4. **Auto-trim** — tap `Space` (or the *trim bg* button): background-
+   coloured areas reachable from the cutout's outer edge become
+   transparent, stray disconnected specks are dropped, and the canvas is
+   cropped tight to the subject (scipy connected-component labelling; the
+   tolerance slider controls how aggressive the colour match is; every
+   trim re-derives from the original cut, so it never compounds).
 
 ## How the "magic" works
 
@@ -39,6 +45,7 @@ mapped back to full resolution for the final cut).
 | add snapping anchor | click |
 | straight (non-snapping) segment | `Alt` + click |
 | close path & cut | double-click / `Enter` / click first anchor |
+| auto-trim leftover background | `Space` (tap) or *trim bg* button |
 | undo last anchor | `Backspace` |
 | discard path | `Esc` |
 | zoom / pan | wheel / `Space`+drag or middle-drag |

@@ -67,6 +67,37 @@ def test_flat_image_gives_straight_path():
     assert len(pts) == 121, f"straight path should be 121 pts, got {len(pts)}"
 
 
+def test_trim_cutout_removes_background_and_specks():
+    """A cutout with leftover light background around a dark subject and a
+    stray speck: trim must clear the background, keep the subject intact,
+    drop the speck, and crop to the subject's bbox."""
+    w, h = 200, 150
+    img = np.zeros((h, w, 4), np.uint8)             # transparent canvas
+    img[20:130, 20:180] = (245, 245, 240, 255)      # opaque leftover bg
+    img[50:100, 40:120, :3] = (40, 45, 50)          # the subject
+    img[30:33, 160:170, :3] = (60, 60, 60)          # stray speck (30 px)
+
+    data, x0, y0, cw, ch = livewire.trim_cutout(img.reshape(-1), w, h, 40)
+    out = np.frombuffer(data, np.uint8).reshape(ch, cw, 4)
+    print(f"  trim: crop at ({x0},{y0}) size {cw}x{ch} (subject bbox 40..120 x 50..100)")
+
+    assert abs(x0 - 39) <= 2 and abs(y0 - 49) <= 2, f"crop origin off: ({x0},{y0})"
+    assert abs(cw - 82) <= 4 and abs(ch - 52) <= 4, f"crop size off: {cw}x{ch}"
+    solid = out[..., 3] > 128
+    assert solid.sum() >= 0.9 * (80 * 50), "subject lost pixels"
+    mean_rgb = out[..., :3][solid].mean(axis=0)
+    assert mean_rgb.max() < 100, f"background survived the trim: {mean_rgb}"
+
+    # background-coloured pixels NOT reachable from outside must survive:
+    img2 = img.copy()
+    img2[60:90, 60:100, :3] = (245, 245, 240)       # bg-coloured hole inside subject
+    data2, _, _, cw2, ch2 = livewire.trim_cutout(img2.reshape(-1), w, h, 40)
+    out2 = np.frombuffer(data2, np.uint8).reshape(ch2, cw2, 4)
+    bright = (out2[..., :3].astype(int).sum(-1) > 600) & (out2[..., 3] > 128)
+    assert bright.sum() >= 0.9 * (30 * 40), "interior bg-coloured region was wrongly removed"
+    print(f"  trim: interior bg-coloured region preserved ({bright.sum()} px)")
+
+
 def bench_browser_resolution():
     """Timing at the app's working resolution (WORK_MAX=768). The browser
     (WASM) is roughly 2-3x slower than native — keep an eye on these."""
@@ -95,6 +126,8 @@ if __name__ == "__main__":
     test_path_clings_to_disk_outline()
     print("test_flat_image_gives_straight_path")
     test_flat_image_gives_straight_path()
+    print("test_trim_cutout_removes_background_and_specks")
+    test_trim_cutout_removes_background_and_specks()
     print("bench_browser_resolution")
     bench_browser_resolution()
     print("OK — all livewire tests passed")

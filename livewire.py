@@ -140,6 +140,67 @@ def set_seed(x, y):
     _seed = seed
 
 
+def trim_cutout(rgba, width, height, tolerance):
+    """Auto-trim a finished cutout (RGBA with transparency outside the
+    lasso): make background-coloured pixels that are *reachable from the
+    outer edge* transparent, drop tiny disconnected specks, and crop to
+    the surviving content.
+
+    The background colour is estimated as the median colour of the
+    cutout's opaque rim — exactly where leftover background lives. Only
+    regions connected to the outside are removed, so background-coloured
+    pixels *inside* the subject survive.
+
+    Returns (rgba_bytes, x, y, w, h): crop offset within the input and
+    the crop size. (b"", 0, 0, 0, 0) if nothing survives.
+    """
+    width = int(width)
+    height = int(height)
+    a = np.frombuffer(_as_bytes_like(rgba), dtype=np.uint8) \
+          .reshape(height, width, 4).copy()
+    alpha = a[..., 3]
+    opaque = alpha > 8
+    if not opaque.any():
+        return (b"", 0, 0, 0, 0)
+
+    eight = np.ones((3, 3), dtype=bool)
+    rim = opaque & ~ndimage.binary_erosion(opaque, structure=eight, border_value=0)
+    rgb = a[..., :3].astype(np.float32)
+    bg = np.median(rgb[rim], axis=0)
+
+    bg_like = np.sqrt(((rgb - bg) ** 2).sum(axis=-1)) <= float(tolerance)
+    outside = ~opaque
+    lab, _ = ndimage.label(bg_like | outside, structure=eight)
+    frame = np.concatenate([lab[0, :], lab[-1, :], lab[:, 0], lab[:, -1]])
+    kill = np.unique(np.concatenate([lab[outside].ravel(), frame]))
+    kill = kill[kill != 0]
+    removed = np.isin(lab, kill) & opaque
+    a[..., 3][removed] = 0
+    # feather the freshly cut edge (the original polygon edge keeps its AA)
+    soft = ndimage.gaussian_filter((~removed).astype(np.float32), 0.6)
+    a[..., 3] = np.minimum(a[..., 3], (soft * 255.0).astype(np.uint8))
+
+    # drop disconnected specks far smaller than the main subject
+    solid = a[..., 3] > 0
+    lab2, n2 = ndimage.label(solid, structure=eight)
+    if n2 > 1:
+        sizes = np.bincount(lab2.ravel(), minlength=n2 + 1)
+        sizes[0] = 0
+        small = np.flatnonzero(sizes < max(16, 0.08 * sizes.max()))
+        a[..., 3][np.isin(lab2, small)] = 0
+        solid = a[..., 3] > 0
+
+    if not solid.any():
+        return (b"", 0, 0, 0, 0)
+    ys, xs = np.nonzero(solid)
+    x0 = max(0, int(xs.min()) - 1)
+    x1 = min(width, int(xs.max()) + 2)
+    y0 = max(0, int(ys.min()) - 1)
+    y1 = min(height, int(ys.max()) + 2)
+    crop = np.ascontiguousarray(a[y0:y1, x0:x1])
+    return (crop.tobytes(), x0, y0, x1 - x0, y1 - y0)
+
+
 def get_path(x, y):
     """Optimal path from the current seed to (x, y), as a flat
     [x0, y0, x1, y1, ...] list of pixel coordinates, seed first."""
