@@ -53,7 +53,7 @@ const state = {
 
   cutout: null,                // {blob, url, w, h, srcCanvas, trimmed}
   trimBusy: false,
-  spaceDown: false, spacePanned: false, pan: null,
+  spaceDown: false, pan: null,
 };
 
 /* ── worker wiring ─────────────────────────────────────────────── */
@@ -365,7 +365,6 @@ function screenDist(e, workPt) {
 els.canvas.addEventListener('pointerdown', (e) => {
   if (e.button === 1 || (e.button === 0 && state.spaceDown)) {
     e.preventDefault();
-    state.spacePanned = true;
     state.pan = { sx: e.clientX, sy: e.clientY, tx: state.view.tx, ty: state.view.ty };
     els.canvas.classList.add('pan-active');
     els.canvas.setPointerCapture(e.pointerId);
@@ -482,11 +481,11 @@ window.addEventListener('keydown', (e) => {
   const tag = e.target && e.target.tagName;
   if (tag === 'BUTTON' || tag === 'INPUT') return; // let native control keys work
   if (e.code === 'Space') {
-    if (!e.repeat) state.spacePanned = false;
     state.spaceDown = true;
     els.canvas.classList.add('panning');
     e.preventDefault();
   }
+  else if (e.key === 'b' || e.key === 'B') requestTrim();
   else if (e.key === 'Escape') resetPath();
   else if (e.key === 'Backspace' || e.key === 'Delete') { e.preventDefault(); undoAnchor(); }
   else if (e.key === 'Enter') requestClose();
@@ -497,7 +496,6 @@ window.addEventListener('keyup', (e) => {
   if (e.code === 'Space') {
     state.spaceDown = false;
     els.canvas.classList.remove('panning');
-    if (!state.spacePanned && state.cutout) requestTrim(); // tap = trim, hold+drag = pan
   }
 });
 
