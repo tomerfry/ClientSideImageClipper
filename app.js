@@ -1,9 +1,17 @@
 /* magic-clipper UI thread.
  *
  * Owns: image loading (open/drop/paste), the pan/zoom view transform,
- * magnetic-lasso path state, canvas rendering, and cutout generation.
- * The livewire engine itself (numpy/scipy Dijkstra) lives in worker.js
- * behind four messages: init / setImage / seed / path.
+ * magnetic-lasso path state, auto-select (shift+click) seed state, canvas
+ * rendering, and cutout generation. The engine itself (numpy/scipy
+ * Dijkstra) lives in worker.js behind init / setImage / seed / path plus
+ * auto / autoReach for the click-to-object flood.
+ *
+ * Two ways to build a selection, never both at once:
+ *   lasso  — anchors + snapped segments (one closed polygon)
+ *   auto   — shift+click / shift+drag seeds -> engine returns the
+ *            object's boundary loops (holes included); the `reach`
+ *            slider re-thresholds the same flood instantly
+ * Both end up as `selectionPolygons()` (full-image px, even-odd fill).
  *
  * Coordinate spaces:
  *   screen px (css)  =  full-image px * view.scale + view.t
@@ -17,6 +25,8 @@
 const WORK_MAX = 960;          // engine grid: longest image side, px
 const CLOSE_RADIUS_PX = 12;    // screen px: click near first anchor closes
 const DUP_RADIUS_PX = 5;       // screen px: clicks this close to the last anchor are ignored
+const REACH_MAX = 100;         // auto-select slider range (engine contrast units)
+const STROKE_STEP_PX = 6;      // screen px between seeds while shift+dragging
 
 const $ = (id) => document.getElementById(id);
 const els = {
@@ -30,6 +40,7 @@ const els = {
   cut: $('btn-cut'), fit: $('btn-fit'), download: $('btn-download'), copy: $('btn-copy'),
   trim: $('btn-trim'), tol: $('tol'), tolVal: $('tol-val'),
   smooth: $('smooth'), smoothVal: $('smooth-val'),
+  reach: $('reach'), reachVal: $('reach-val'), reachMode: $('reach-mode'),
 };
 const ctx = els.canvas.getContext('2d');
 const reducedMotion = matchMedia('(prefers-reduced-motion: reduce)').matches;
@@ -51,6 +62,12 @@ const state = {
   segments: [],                // [Int32Array flat x,y work coords], segments[i] ends at anchors[i+1]
   livePath: null,              // Int32Array, current seed -> cursor
   closed: false,
+
+  auto: null,                  // auto-select session (see newAuto)
+  autoGen: 0,                  // bumped per auto request; stale replies are dropped
+  stroke: null,                // shift+drag in progress: {sign, group, sx, sy}
+  shiftDown: false,
+  selPath: null,               // cached {sel, dim} Path2D of the selection (full-image px)
 
   cutout: null,                // {blob, url, w, h, srcCanvas, baseCanvas, trimmed, smoothed}
   trimSrc: null,               // canvas the in-flight/last trim derives from
@@ -102,6 +119,14 @@ worker.onmessage = (e) => {
       onPathReply(m.token, m.points);
       break;
 
+    case 'busy':
+      showBusy(m.text);
+      break;
+
+    case 'auto':
+      onAutoResult(m);
+      break;
+
     case 'trimmed':
       state.trimBusy = false;
       hideBusy();
@@ -128,6 +153,11 @@ worker.onmessage = (e) => {
       console.error('worker error in', m.context, m.text);
       setStatus('error', `python engine error (${m.context}): ${m.text}`);
       hideBusy();
+      if ((m.context === 'auto' || m.context === 'autoReach') && state.auto) {
+        state.auto.inFlight = false;
+        state.auto.pending = null;
+        state.auto.closeWhenIdle = false;
+      }
       break;
   }
 };
@@ -173,6 +203,7 @@ function onPathReply(token, points) {
   state.pendingCommit = null;
   state.segments.push(points);
   state.livePath = null;
+  invalidateSelection();
   if (token.purpose === 'close') {
     state.closed = true;
     hideBusy();
@@ -211,11 +242,13 @@ function hideBusy() {
 }
 
 function updateUi() {
-  const hasPath = state.anchors.length > 0;
+  const autoSel = !!(state.auto && state.auto.contours.length);
+  const hasPath = state.anchors.length > 0 || !!state.auto;
   els.undo.disabled = !hasPath;
   els.reset.disabled = !hasPath;
-  els.cut.disabled = !(state.anchors.length >= 2 && !state.closed);
+  els.cut.disabled = !((state.anchors.length >= 2 || autoSel) && !state.closed);
   els.fit.disabled = !state.bitmap;
+  els.reach.disabled = !state.imageReady;
   els.download.disabled = !state.cutout;
   els.copy.disabled = !state.cutout || typeof ClipboardItem === 'undefined';
   els.trim.disabled = !state.engineReady || (!state.cutout && !state.bitmap);
@@ -397,7 +430,17 @@ els.canvas.addEventListener('pointerdown', (e) => {
     els.canvas.setPointerCapture(e.pointerId);
     return;
   }
-  if (e.button !== 0 || !state.imageReady || state.closed) return;
+  if (!state.imageReady) return;
+  if (e.shiftKey && (e.button === 0 || e.button === 2)) {
+    e.preventDefault();
+    beginAutoInput(e, e.button === 2 || e.altKey ? -1 : 1);
+    return;
+  }
+  if (e.button !== 0 || state.closed) return;
+  if (state.auto) {
+    setStatus('ready', 'auto-select active — shift+click/drag adds, shift+right-click subtracts, enter cuts, esc clears');
+    return;
+  }
 
   const pt = eventToWork(e);
   const last = state.anchors[state.anchors.length - 1];
@@ -427,21 +470,29 @@ els.canvas.addEventListener('pointermove', (e) => {
     requestRender();
     return;
   }
+  if (state.stroke) { extendStroke(e); return; }
   if (!state.imageReady || state.closed || state.anchors.length === 0) return;
   state.wantPath = eventToWork(e);
   pumpPath();
 });
 
-els.canvas.addEventListener('pointerup', (e) => {
+function endPointer(e) {
   if (state.pan) {
     state.pan = null;
     els.canvas.classList.remove('pan-active');
     try { els.canvas.releasePointerCapture(e.pointerId); } catch {}
   }
-});
+  if (state.stroke) {
+    state.stroke = null;
+    try { els.canvas.releasePointerCapture(e.pointerId); } catch {}
+  }
+}
+els.canvas.addEventListener('pointerup', endPointer);
+els.canvas.addEventListener('pointercancel', endPointer);
 
 els.canvas.addEventListener('dblclick', (e) => {
   e.preventDefault();
+  if (e.shiftKey) return; // shift+dblclick is just two seeds, never a close
   requestClose();
 });
 els.canvas.addEventListener('contextmenu', (e) => e.preventDefault());
@@ -451,12 +502,14 @@ function commitStraight(pt) {
   state.segments.push(Int32Array.from([a.x, a.y, pt.x, pt.y]));
   state.anchors.push(pt);
   state.livePath = null;
+  invalidateSelection();
   sendSeed(pt);
   updateUi();
   requestRender();
 }
 
 function requestClose() {
+  if (state.auto) { commitAuto(); return; }
   if (state.closed || state.anchors.length < 2 || state.pendingCommit) return;
   if (state.seedBusy) return; // last anchor's tree not ready yet
   const first = state.anchors[0];
@@ -466,6 +519,7 @@ function requestClose() {
 }
 
 function undoAnchor() {
+  if (state.auto) { undoAutoSeed(); return; }
   if (state.closed) {           // reopen: drop only the closing segment
     state.segments.pop();
     state.closed = false;
@@ -481,6 +535,7 @@ function undoAnchor() {
     hideBusy();
   }
   state.pendingCommit = null;
+  invalidateSelection();
   updateUi();
   requestRender();
 }
@@ -494,6 +549,11 @@ function resetPath() {
   state.wantPath = null;
   state.seedGen++;
   state.seedBusy = false;
+  state.auto = null;
+  state.stroke = null;
+  state.autoGen++;            // orphan any in-flight auto reply
+  invalidateSelection();
+  setReachBadge();
   hideBusy();
   updateUi();
   requestRender();
@@ -512,6 +572,12 @@ window.addEventListener('keydown', (e) => {
     els.canvas.classList.add('panning');
     e.preventDefault();
   }
+  else if (e.key === 'Shift') {
+    state.shiftDown = true;
+    els.canvas.classList.add('wand');
+  }
+  else if (e.key === '[') nudgeReach(-4);
+  else if (e.key === ']') nudgeReach(4);
   else if (e.key === 'b' || e.key === 'B') requestTrim();
   else if (e.key === 's' || e.key === 'S') {
     if (Number(els.smooth.value) === 0) {
@@ -531,7 +597,254 @@ window.addEventListener('keyup', (e) => {
     state.spaceDown = false;
     els.canvas.classList.remove('panning');
   }
+  if (e.key === 'Shift') {
+    state.shiftDown = false;
+    els.canvas.classList.remove('wand');
+  }
 });
+window.addEventListener('blur', () => { // modifier keys released while unfocused
+  state.spaceDown = false;
+  state.shiftDown = false;
+  els.canvas.classList.remove('panning', 'wand');
+});
+
+/* ── auto-select (shift+click / shift+drag) ────────────────────── */
+
+function newAuto() {
+  return {
+    seeds: [],          // [{x, y, sign, group}] work coords; a stroke shares one group
+    group: 0,
+    contours: [],       // [Float32Array x,y corner coords in work px], holes included
+    area: 0,            // work px inside the selection
+    reach: null,        // null until the engine's first suggestion arrives
+    suggested: null,
+    manual: false,      // the user touched the reach slider for this selection
+    inFlight: false,    // one engine request at a time; latest pending wins
+    pending: null,      // {seeds?: true, reach?: n} merged until it can be sent
+    closeWhenIdle: false, // enter/cut arrived while a request was in flight
+    wasClosed: false,   // slider drag reopened a cut; re-cut on release
+  };
+}
+
+function beginAutoInput(e, sign) {
+  if (state.anchors.length) {
+    setStatus('ready', state.closed
+      ? 'a lasso cut is active — press esc to start over, then shift+click'
+      : 'finish (enter) or discard (esc) the lasso before auto-selecting');
+    return;
+  }
+  if (!state.auto) state.auto = newAuto();
+  const a = state.auto;
+  if (sign < 0 && !a.seeds.some((s) => s.sign > 0)) {
+    setStatus('ready', 'shift+right-click subtracts — shift+click the object first');
+    return;
+  }
+  const pt = eventToWork(e);
+  const last = a.seeds[a.seeds.length - 1];
+  if (last && last.sign === sign && last.x === pt.x && last.y === pt.y) return; // dblclick's 2nd click
+  if (state.closed) reopenSelection();
+  a.group++;
+  a.seeds.push({ x: pt.x, y: pt.y, sign, group: a.group });
+  state.stroke = { sign, group: a.group, sx: e.clientX, sy: e.clientY };
+  try { els.canvas.setPointerCapture(e.pointerId); } catch {}
+  requestAuto({ seeds: true });
+  updateUi();
+  requestRender();
+}
+
+function extendStroke(e) {
+  const s = state.stroke, a = state.auto;
+  if (!a) { state.stroke = null; return; }
+  if (Math.hypot(e.clientX - s.sx, e.clientY - s.sy) < STROKE_STEP_PX) return;
+  s.sx = e.clientX;
+  s.sy = e.clientY;
+  const pt = eventToWork(e);
+  const last = a.seeds[a.seeds.length - 1];
+  if (last && last.x === pt.x && last.y === pt.y) return;
+  a.seeds.push({ x: pt.x, y: pt.y, sign: s.sign, group: s.group });
+  requestAuto({ seeds: true });   // live preview while painting (latest wins)
+  requestRender();
+}
+
+function requestAuto(change) {
+  const a = state.auto;
+  if (!a) return;
+  a.pending = Object.assign(a.pending || {}, change);
+  pumpAuto();
+}
+
+function pumpAuto() {
+  const a = state.auto;
+  if (!a || a.inFlight || !a.pending || !state.imageReady) return;
+  const p = a.pending;
+  a.pending = null;
+  a.gen = ++state.autoGen;
+  if (p.seeds) {
+    const pos = [], neg = [];
+    for (const s of a.seeds) (s.sign > 0 ? pos : neg).push(s.x, s.y);
+    if (!pos.length) { a.contours = []; a.area = 0; invalidateSelection(); requestRender(); return; }
+    a.inFlight = true;
+    showBusy('detecting object…');
+    // reach: null on the very first request -> the engine picks one
+    worker.postMessage({ type: 'auto', pos, neg, reach: a.reach, gen: a.gen });
+  } else {
+    a.inFlight = true;
+    worker.postMessage({ type: 'autoReach', reach: p.reach, gen: a.gen });
+  }
+}
+
+function onAutoResult(m) {
+  const a = state.auto;
+  if (!a || m.gen !== a.gen) return; // stale (seeds changed / selection cleared meanwhile)
+  a.inFlight = false;
+  hideBusy();
+  a.contours = splitContours(m.coords, m.lens);
+  a.area = m.area;
+  if (m.suggested != null) a.suggested = m.suggested;
+  a.reach = m.reach;
+  if (!a.manual) setReachUi(m.reach);
+  setReachBadge();
+  invalidateSelection();
+  if (a.pending) pumpAuto();
+  else if (a.closeWhenIdle) { a.closeWhenIdle = false; commitAuto(); }
+  if (!state.closed) {
+    const px = Math.round(a.area * state.wsx * state.wsy);
+    setStatus('ready', a.area
+      ? `object: ~${px.toLocaleString()} px · reach ${a.reach}${a.manual ? '' : ' (auto)'} — shift+drag adds, shift+right-click subtracts, [ ] adjusts, enter cuts`
+      : 'nothing within reach — raise reach (]) or shift+click elsewhere');
+  }
+  updateUi();
+  requestRender();
+}
+
+function splitContours(coords, lens) {
+  const out = [];
+  let o = 0;
+  for (const n of lens) {
+    out.push(coords.subarray(o, o + n * 2));
+    o += n * 2;
+  }
+  return out;
+}
+
+function commitAuto() {
+  const a = state.auto;
+  if (state.closed) return;
+  if (a.inFlight || a.pending) { a.closeWhenIdle = true; return; } // cut once the preview is current
+  if (!a.contours.length) {
+    setStatus('ready', 'nothing selected — shift+click or shift+drag over an object');
+    return;
+  }
+  state.closed = true;
+  a.wasClosed = false;
+  invalidateSelection();
+  buildCutout();
+  updateUi();
+  requestRender();
+}
+
+function reopenSelection() {
+  state.closed = false;
+  invalidateSelection();
+  updateUi();
+}
+
+function undoAutoSeed() {
+  const a = state.auto;
+  if (state.closed) { reopenSelection(); requestRender(); return; }
+  const g = a.seeds.length ? a.seeds[a.seeds.length - 1].group : 0;
+  a.seeds = a.seeds.filter((s) => s.group !== g);   // a whole stroke at a time
+  if (!a.seeds.length) { clearAuto(); return; }
+  a.closeWhenIdle = false;
+  requestAuto({ seeds: true });
+  updateUi();
+  requestRender();
+}
+
+function clearAuto() {
+  state.auto = null;
+  state.stroke = null;
+  state.closed = false;
+  state.autoGen++;
+  invalidateSelection();
+  setReachBadge();
+  hideBusy();
+  updateUi();
+  requestRender();
+}
+
+function setReachUi(v) {
+  els.reach.value = String(v);
+  els.reachVal.textContent = String(v);
+}
+
+function setReachBadge() {
+  const a = state.auto;
+  els.reachMode.textContent = a && !a.manual && a.reach != null ? 'auto' : '';
+}
+
+function setReach(v) {
+  v = Math.min(REACH_MAX, Math.max(1, Math.round(v)));
+  setReachUi(v);
+  const a = state.auto;
+  if (!a) return;
+  a.manual = true;
+  a.reach = v;
+  setReachBadge();
+  if (state.closed) { reopenSelection(); a.wasClosed = true; } // preview edits; re-cut on release
+  requestAuto({ reach: v });
+}
+
+function nudgeReach(delta) {
+  if (!state.auto) {
+    setStatus('ready', 'reach adjusts an auto-selection — shift+click an object first');
+    return;
+  }
+  const recut = state.closed || state.auto.wasClosed;
+  setReach(Number(els.reach.value) + delta);
+  if (recut) { state.auto.wasClosed = false; requestClose(); }
+}
+
+els.reach.addEventListener('input', () => setReach(Number(els.reach.value)));
+els.reach.addEventListener('change', () => {
+  const a = state.auto;
+  if (a && a.wasClosed) { a.wasClosed = false; requestClose(); }
+});
+
+/* ── selection geometry (shared by lasso + auto) ───────────────── */
+
+function selectionPolygons() { // -> [[[x, y], ...], ...] in full-image px
+  if (state.auto) {
+    return state.auto.contours.map((c) => {
+      const poly = [];
+      for (let i = 0; i < c.length; i += 2) poly.push([c[i] * state.wsx, c[i + 1] * state.wsy]);
+      return poly;
+    });
+  }
+  const poly = [];
+  for (const seg of state.segments) {
+    for (let i = 0; i < seg.length; i += 2) {
+      poly.push([(seg[i] + 0.5) * state.wsx, (seg[i + 1] + 0.5) * state.wsy]);
+    }
+  }
+  return poly.length ? [poly] : [];
+}
+
+function invalidateSelection() { state.selPath = null; }
+
+function selectionPath() { // cached Path2D pair: the selection, and "everything but" it
+  if (state.selPath) return state.selPath;
+  const sel = new Path2D();
+  for (const poly of selectionPolygons()) {
+    poly.forEach(([x, y], i) => (i === 0 ? sel.moveTo(x, y) : sel.lineTo(x, y)));
+    sel.closePath();
+  }
+  const dim = new Path2D();
+  dim.rect(0, 0, state.fullW, state.fullH);
+  dim.addPath(sel);
+  state.selPath = { sel, dim };
+  return state.selPath;
+}
 
 /* ── rendering ─────────────────────────────────────────────────── */
 
@@ -579,28 +892,36 @@ function render() {
 
   const lw = (px) => px / v.scale;
 
-  if (state.closed && state.segments.length) {
+  const autoSel = state.auto && state.auto.contours.length;
+  if (state.closed && (state.segments.length || autoSel)) {
     // dim everything outside the selection, then marching ants on it
-    ctx.save();
-    ctx.beginPath();
-    ctx.rect(0, 0, state.fullW, state.fullH);
-    traceSelection();
+    const { sel, dim } = selectionPath();
     ctx.fillStyle = 'rgba(30,31,28,0.62)';
-    ctx.fill('evenodd');
-    ctx.restore();
-
-    ctx.beginPath();
-    traceSelection();
-    ctx.closePath();
+    ctx.fill(dim, 'evenodd');
+    ctx.lineJoin = 'round';
     ctx.strokeStyle = 'rgba(30,31,28,0.9)';
     ctx.lineWidth = lw(3);
-    ctx.stroke();
+    ctx.stroke(sel);
     ctx.strokeStyle = '#f92672';
     ctx.lineWidth = lw(1.6);
     ctx.setLineDash([lw(6), lw(5)]);
     ctx.lineDashOffset = -lw(antsPhase % 11);
-    ctx.stroke();
+    ctx.stroke(sel);
     ctx.setLineDash([]);
+  } else if (state.auto) {
+    // auto-select preview: green tint on the detected object + its outline
+    if (autoSel) {
+      const { sel } = selectionPath();
+      ctx.fillStyle = 'rgba(166,226,46,0.26)';
+      ctx.fill(sel, 'evenodd');
+      ctx.lineJoin = 'round';
+      ctx.strokeStyle = 'rgba(30,31,28,0.85)';
+      ctx.lineWidth = lw(2.6);
+      ctx.stroke(sel);
+      ctx.strokeStyle = '#a6e22e';
+      ctx.lineWidth = lw(1.4);
+      ctx.stroke(sel);
+    }
   } else {
     // committed segments: pink over a soft halo (two strokes — canvas
     // shadows behave inconsistently under transforms across browsers)
@@ -626,6 +947,9 @@ function render() {
     }
   }
 
+  // auto-select seeds: green = include, pink = exclude; strokes as polylines
+  if (state.auto && !state.closed) drawSeeds(lw);
+
   // anchors
   state.anchors.forEach((a, i) => {
     const half = lw(i === 0 && state.anchors.length >= 2 && !state.closed ? 4.5 : 3);
@@ -636,6 +960,39 @@ function render() {
     ctx.fillRect(cx - half, cy - half, half * 2, half * 2);
     ctx.strokeRect(cx - half, cy - half, half * 2, half * 2);
   });
+}
+
+function drawSeeds(lw) {
+  const groups = new Map();
+  for (const s of state.auto.seeds) {
+    if (!groups.has(s.group)) groups.set(s.group, []);
+    groups.get(s.group).push(s);
+  }
+  ctx.lineCap = 'round';
+  ctx.lineJoin = 'round';
+  for (const pts of groups.values()) {
+    const colour = pts[0].sign > 0 ? '#a6e22e' : '#f92672';
+    const cx = (p) => (p.x + 0.5) * state.wsx, cy = (p) => (p.y + 0.5) * state.wsy;
+    if (pts.length > 1) {
+      ctx.beginPath();
+      pts.forEach((p, i) => (i === 0 ? ctx.moveTo(cx(p), cy(p)) : ctx.lineTo(cx(p), cy(p))));
+      ctx.strokeStyle = 'rgba(30,31,28,0.8)';
+      ctx.lineWidth = lw(5);
+      ctx.stroke();
+      ctx.strokeStyle = colour;
+      ctx.lineWidth = lw(3);
+      ctx.stroke();
+    }
+    const p = pts[0];
+    ctx.beginPath();
+    ctx.arc(cx(p), cy(p), lw(3.5), 0, Math.PI * 2);
+    ctx.fillStyle = colour;
+    ctx.fill();
+    ctx.strokeStyle = '#1e1f1c';
+    ctx.lineWidth = lw(1);
+    ctx.stroke();
+  }
+  ctx.lineCap = 'butt';
 }
 
 new ResizeObserver(() => {
@@ -663,19 +1020,15 @@ function chaikin(pts, iterations) {
 }
 
 function buildCutout() {
-  const poly = [];
-  for (const seg of state.segments) {
-    for (let i = 0; i < seg.length; i += 2) {
-      poly.push([(seg[i] + 0.5) * state.wsx, (seg[i + 1] + 0.5) * state.wsy]);
-    }
-  }
-  if (poly.length < 3) return;
-  const smooth = chaikin(poly, 2);
+  const polys = selectionPolygons().filter((p) => p.length >= 3).map((p) => chaikin(p, 2));
+  if (!polys.length) return;
 
   let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
-  for (const [x, y] of smooth) {
-    if (x < minX) minX = x; if (x > maxX) maxX = x;
-    if (y < minY) minY = y; if (y > maxY) maxY = y;
+  for (const poly of polys) {
+    for (const [x, y] of poly) {
+      if (x < minX) minX = x; if (x > maxX) maxX = x;
+      if (y < minY) minY = y; if (y > maxY) maxY = y;
+    }
   }
   minX = Math.max(0, Math.floor(minX) - 1);
   minY = Math.max(0, Math.floor(minY) - 1);
@@ -688,10 +1041,12 @@ function buildCutout() {
   const octx = oc.getContext('2d');
   octx.translate(-minX, -minY);
   octx.beginPath();
-  smooth.forEach(([x, y], i) => (i === 0 ? octx.moveTo(x, y) : octx.lineTo(x, y)));
-  octx.closePath();
+  for (const poly of polys) {
+    poly.forEach(([x, y], i) => (i === 0 ? octx.moveTo(x, y) : octx.lineTo(x, y)));
+    octx.closePath();
+  }
   octx.fillStyle = '#fff';
-  octx.fill();                                   // antialiased mask
+  octx.fill('evenodd');                          // antialiased mask (holes stay holes)
   octx.globalCompositeOperation = 'source-in';   // keep image only inside it
   octx.drawImage(state.bitmap, 0, 0);
 

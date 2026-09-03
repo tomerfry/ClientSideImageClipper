@@ -88,6 +88,7 @@
   #canvas { position: absolute; inset: 0; width: 100%; height: 100%; cursor: crosshair; touch-action: none; }
   #canvas.panning { cursor: grab; }
   #canvas.pan-active { cursor: grabbing; }
+  #canvas.wand { cursor: cell; }          /* shift held: auto-select */
 
   /* empty-state drop zone */
   #dropzone {
@@ -165,6 +166,8 @@
   .tol-row input[type=range] { flex: 1; accent-color: var(--pink); min-width: 0; }
   .tol-row label { min-width: 6.5ch; }
   .tol-row .val { color: var(--purple); min-width: 3ch; text-align: right; font-variant-numeric: tabular-nums; }
+  .tol-row .mode { color: var(--green); font-size: .8em; min-width: 4ch; }
+  .panel-title .dim { color: var(--fg-dim); font-weight: 400; opacity: .8; }
   .hints { list-style: none; display: flex; flex-direction: column; gap: .45rem; color: var(--fg-dim); font-size: .85rem; }
   .hints li::before { content: "› "; color: var(--pink); }
   .hints kbd { white-space: nowrap; }
@@ -231,6 +234,15 @@
   </div>
 
   <aside id="panel">
+    <div class="panel-title">// auto-select <span class="dim">· <kbd>shift</kbd>+click an object</span></div>
+    <div class="tol-row">
+      <label for="reach">reach</label>
+      <input type="range" id="reach" min="1" max="100" value="30" disabled
+        title="Contrast budget of the auto-selection: how much edge the region may cross before it stops ([ / ] keys). Picked automatically on the first click.">
+      <span id="reach-val" class="val">30</span>
+      <span id="reach-mode" class="mode"></span>
+    </div>
+
     <div class="panel-title">// result</div>
     <div id="result-box">
       <div class="placeholder" id="result-placeholder">close a path to cut the region out<br>(transparent png)</div>
@@ -264,6 +276,9 @@
       <li>the live path <b>clings to edges</b> as you move (dijkstra over a gradient cost map — numpy/scipy in wasm)</li>
       <li><b>click</b> again to pin the snapped segment</li>
       <li><kbd>alt</kbd>+click = straight segment (no snap)</li>
+      <li><kbd>shift</kbd>+click / drag = <b>auto-select</b>: the object under the cursor is detected by flooding outward until a colour edge is hit (dijkstra on a contrast-cost grid); paint across a multi-part object to cover it</li>
+      <li><kbd>shift</kbd>+right-click / <kbd>shift</kbd>+<kbd>alt</kbd>+click = subtract a region that leaked in</li>
+      <li><b>reach</b> slider or <kbd>[</kbd> <kbd>]</kbd> = grow / shrink the auto-selection (auto-picked first)</li>
       <li><b>double-click</b> / <kbd>enter</kbd> / click the first anchor = close &amp; cut</li>
       <li><kbd>b</kbd> / <b>trim bg</b> = auto-remove leftover background + tighten the crop — works on a finished cut, or on the whole image if you haven't cut yet</li>
       <li><kbd>s</kbd> / <b>smooth</b> slider = round jagged outline edges of the cutout</li>
@@ -278,7 +293,7 @@
   <span id="status-text">booting python engine…</span>
   <span id="img-info"></span>
   <span class="spacer"></span>
-  <span class="keys">click add · dblclick close · alt straight · b trim · s smooth · ⌫ undo · esc reset · wheel zoom · space+drag pan</span>
+  <span class="keys">click add · shift+click auto-select · [ ] reach · dblclick close · alt straight · b trim · s smooth · ⌫ undo · esc reset · wheel zoom · space+drag pan</span>
 </footer>
 
 <input type="file" id="file-input" accept="image/*" hidden>

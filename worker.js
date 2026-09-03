@@ -5,6 +5,8 @@
  *   setImage  -> imageReady       (cost graph built)
  *   seed      -> seedReady        (Dijkstra tree computed for an anchor)
  *   path      -> path             (seed->cursor optimal path, Int32Array)
+ *   auto      -> auto             (shift+click seeds -> object contours)
+ *   autoReach -> auto             (re-threshold the last flood at a new reach)
  *
  * Messages are handled strictly in order, so a `path` reply always
  * reflects the most recent `seed`/`setImage` that preceded it.
@@ -20,6 +22,21 @@ let livewire = null;
 const post = (msg, transfer) => self.postMessage(msg, transfer || []);
 const fail = (context, err) =>
   post({ type: 'error', context, text: (err && err.message) || String(err) });
+
+/* Threshold the current auto-select flood at `reach` and ship the mask's
+ * boundary loops (pixel-corner polygons, holes included) as one flat
+ * Float32Array plus a per-loop vertex count. */
+function postAutoMask(gen, reach, suggested) {
+  const proxy = livewire.auto_mask(reach);
+  const [buf, lens, area] = proxy.toJs();
+  proxy.destroy();
+  const bytes = new Uint8Array(buf && buf.length ? buf : 0); // fresh, 4-byte aligned copy
+  const coords = new Float32Array(bytes.buffer, 0, bytes.length >> 2);
+  post(
+    { type: 'auto', gen, reach, suggested, coords, lens: Array.from(lens || []), area },
+    [coords.buffer]
+  );
+}
 
 async function init(pySourceUrl) {
   try {
@@ -92,6 +109,24 @@ self.onmessage = (e) => {
         post({ type: 'smoothed', rgba, width, height, x, y }, [rgba.buffer]);
       } catch (err) {
         fail('smooth', err);
+      }
+      break;
+
+    case 'auto':
+      try {
+        if (!livewire.auto_ready()) post({ type: 'busy', text: 'mapping colour edges (first auto-select on this image)…' });
+        const suggested = livewire.auto_select(m.pos, m.neg);
+        postAutoMask(m.gen, m.reach == null ? suggested : m.reach, suggested);
+      } catch (err) {
+        fail('auto', err);
+      }
+      break;
+
+    case 'autoReach':
+      try {
+        postAutoMask(m.gen, m.reach, null);
+      } catch (err) {
+        fail('autoReach', err);
       }
       break;
 
