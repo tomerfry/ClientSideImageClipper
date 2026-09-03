@@ -154,9 +154,204 @@ def bench_browser_resolution():
           f"set_seed (dijkstra) {t2 - t1:.2f}s | get_path {(t3 - t2) * 1000:.1f}ms")
 
 
+# ── auto-select ────────────────────────────────────────────────────
+
+def rgba_from_rgb(rgb):
+    """(h, w, 3) uint8 -> flat RGBA buffer."""
+    h, w = rgb.shape[:2]
+    out = np.empty((h, w, 4), dtype=np.uint8)
+    out[..., :3] = rgb
+    out[..., 3] = 255
+    return out.reshape(-1)
+
+
+def iou(a, b):
+    return (a & b).sum() / max(1, (a | b).sum())
+
+
+def polygon_area(coords, lens):
+    """Shoelace area of every loop. With the foreground on the left in
+    y-down screen coordinates outer loops run clockwise (negative
+    shoelace) and holes counter-clockwise, so -sum equals the mask area."""
+    total, o = 0.0, 0
+    for n in lens:
+        p = coords[o:o + n]
+        x, y = p[:, 0], p[:, 1]
+        total += 0.5 * (np.dot(x, np.roll(y, -1)) - np.dot(y, np.roll(x, -1)))
+        o += n
+    return -total
+
+
+def test_auto_select_disk_single_click():
+    """A shaded, slightly noisy disk on a noisy background: one click in
+    the middle must select the whole disk (and nothing else) at the
+    automatically chosen reach, and the traced contour must enclose it."""
+    from scipy import ndimage
+    size, cx, cy, r = 320, 160, 150, 90
+    yy, xx = np.mgrid[0:size, 0:size]
+    disk = np.hypot(xx - cx, yy - cy) < r
+    rng = np.random.default_rng(1)
+    shade = 0.15 * (xx - cx) / r                                  # smooth shading inside
+    rgb = np.empty((size, size, 3), np.float32)
+    rgb[..., 0] = np.where(disk, 60 + 40 * shade, 200)
+    rgb[..., 1] = np.where(disk, 110 + 40 * shade, 205)
+    rgb[..., 2] = np.where(disk, 200 + 40 * shade, 210)
+    rgb += rng.normal(0, 3.0, rgb.shape)
+    rgb = ndimage.gaussian_filter(rgb, (0.8, 0.8, 0))              # soften the outline a bit
+    rgb = np.clip(rgb, 0, 255).astype(np.uint8)
+
+    livewire.set_image(rgba_from_rgb(rgb), size, size)
+    t0 = time.perf_counter()
+    reach = livewire.auto_select([cx, cy], [])
+    t1 = time.perf_counter()
+    buf, lens, area = livewire.auto_mask(reach)
+    t2 = time.perf_counter()
+    mask = livewire.auto_mask_array(reach)
+    score = iou(mask, disk)
+    print(f"  disk: auto reach {reach}, area {area} (disk {disk.sum()}), IoU {score:.3f}, "
+          f"{len(lens)} loop(s) / {sum(lens)} verts | select {t1 - t0:.2f}s mask {(t2 - t1) * 1000:.0f}ms")
+    assert 8 <= reach <= 95, f"auto reach out of range: {reach}"
+    assert score > 0.95, f"disk not selected cleanly (IoU {score:.3f})"
+    assert len(lens) == 1, f"expected one boundary loop, got {len(lens)}"
+    coords = np.frombuffer(buf, np.float32).reshape(-1, 2)
+    poly_area = polygon_area(coords, lens)
+    assert abs(poly_area - area) < 1e-3 * area + 1, f"contour area {poly_area} != mask area {area}"
+    radii = np.hypot(coords[:, 0] - cx, coords[:, 1] - cy)
+    assert np.abs(radii - r).max() < 4.0, f"contour strays from the outline: {np.abs(radii - r).max():.1f}px"
+
+    # the reach slider grows/shrinks smoothly: monotone area, no leak below the edge
+    areas = [livewire.auto_mask_array(t).sum() for t in (5, reach, 95)]
+    assert areas[0] <= areas[1] <= areas[2], f"area not monotone in reach: {areas}"
+    assert livewire.auto_mask_array(max(4, reach // 2)).sum() > 0.9 * disk.sum(), \
+        "disk should already be full well below the auto reach"
+
+
+def test_auto_select_two_tone_object_needs_two_seeds():
+    """An object made of two flat colour halves on a background: one seed
+    selects its half only (the internal edge is real); a second seed on
+    the other half selects the whole object; a negative seed on the
+    unselected half must not disturb a correct single-half selection."""
+    h, w = 200, 300
+    rgb = np.full((h, w, 3), (235, 235, 230), np.uint8)
+    left = np.zeros((h, w), bool); left[50:150, 60:150] = True
+    right = np.zeros((h, w), bool); right[50:150, 150:240] = True
+    rgb[left] = (40, 80, 160)
+    rgb[right] = (170, 60, 50)
+    rng = np.random.default_rng(2)
+    rgb = np.clip(rgb.astype(np.float32) + rng.normal(0, 2.0, rgb.shape), 0, 255).astype(np.uint8)
+    livewire.set_image(rgba_from_rgb(rgb), w, h)
+
+    reach = livewire.auto_select([100, 100], [])
+    m1 = livewire.auto_mask_array(reach)
+    print(f"  two-tone: one seed -> reach {reach}, IoU(left) {iou(m1, left):.3f}, IoU(both) {iou(m1, left | right):.3f}")
+    assert iou(m1, left) > 0.95, "single seed should select exactly its half"
+
+    livewire.auto_select([100, 100, 195, 100], [])
+    m2 = livewire.auto_mask_array(reach)
+    print(f"  two-tone: two seeds -> IoU(both) {iou(m2, left | right):.3f}")
+    assert iou(m2, left | right) > 0.95, "two seeds should cover both halves"
+
+    livewire.auto_select([100, 100], [200, 130])
+    m3 = livewire.auto_mask_array(reach)
+    print(f"  two-tone: left seed + negative on the right -> IoU(left) {iou(m3, left):.3f}")
+    assert iou(m3, left) > 0.95, "a negative seed beyond an edge must not eat into the selection"
+
+
+def test_auto_select_leak_is_stopped_by_negative_seed():
+    """A disk joined to a second blob by a thin bridge of the same colour:
+    a single seed leaks through the bridge (as it should — there is no
+    edge), a negative seed on the second blob cuts the leak off."""
+    h, w = 220, 360
+    yy, xx = np.mgrid[0:h, 0:w]
+    a = np.hypot(xx - 100, yy - 110) < 60
+    b = np.hypot(xx - 270, yy - 110) < 55
+    bridge = (np.abs(yy - 110) < 4) & (xx > 100) & (xx < 270)
+    obj = a | b | bridge
+    rgb = np.where(obj[..., None], np.array([50, 160, 90], np.uint8), np.array([240, 240, 235], np.uint8))
+    livewire.set_image(rgba_from_rgb(rgb), w, h)
+
+    reach = livewire.auto_select([100, 110], [])
+    leaked = livewire.auto_mask_array(reach)
+    print(f"  leak: single seed reach {reach} -> IoU(a) {iou(leaked, a):.3f}, IoU(a|b) {iou(leaked, obj):.3f}")
+    assert iou(leaked, obj) > 0.9, "the bridge should let the flood through (no edge to stop it)"
+
+    livewire.auto_select([100, 110], [270, 110])
+    fixed = livewire.auto_mask_array(reach)
+    print(f"  leak: + negative seed on b -> IoU(a) {iou(fixed, a):.3f}, b left {int((fixed & b).sum())} px")
+    assert iou(fixed, a) > 0.85, "negative seed should keep only disk a"
+    assert (fixed & b).sum() < 0.05 * b.sum(), "negative seed's blob should be gone"
+
+
+def test_auto_mask_contours_keep_holes_and_fill_specks():
+    """A ring keeps its hole as a second loop; a tiny speck inside a disk
+    gets filled; the contour polygons reproduce the mask area exactly."""
+    h, w = 200, 200
+    yy, xx = np.mgrid[0:h, 0:w]
+    rr = np.hypot(xx - 100, yy - 100)
+    ring = (rr < 70) & (rr > 30)
+    rgb = np.where(ring[..., None], np.array([200, 80, 40], np.uint8), np.array([30, 30, 35], np.uint8))
+    livewire.set_image(rgba_from_rgb(rgb), w, h)
+    reach = livewire.auto_select([100, 40], [])
+    buf, lens, area = livewire.auto_mask(reach)
+    mask = livewire.auto_mask_array(reach)
+    print(f"  ring: reach {reach}, {len(lens)} loops, IoU {iou(mask, ring):.3f}")
+    assert iou(mask, ring) > 0.95, "ring not selected"
+    assert len(lens) == 2, f"ring should trace 2 loops (outer + hole), got {len(lens)}"
+    coords = np.frombuffer(buf, np.float32).reshape(-1, 2)
+    assert abs(polygon_area(coords, lens) - area) < 1, "loops (with hole) must reproduce the mask area"
+
+    disk = rr < 70
+    rgb2 = np.where(disk[..., None], np.array([200, 80, 40], np.uint8), np.array([30, 30, 35], np.uint8))
+    rgb2[98:101, 98:101] = (30, 30, 35)                      # 3x3 speck of background colour
+    livewire.set_image(rgba_from_rgb(rgb2), w, h)
+    reach = livewire.auto_select([60, 100], [])
+    buf, lens, area = livewire.auto_mask(reach)
+    print(f"  speck: reach {reach}, {len(lens)} loop(s), area {area} (disk {disk.sum()})")
+    assert len(lens) == 1, "a tiny interior speck should be filled, not traced as a hole"
+    assert area >= 0.97 * disk.sum(), "disk lost pixels (boundary may sit <1px inside the blurred edge)"
+
+
+def test_trace_contours_handles_saddles_and_multiple_blobs():
+    """Direct contour-tracer check on a mask with a diagonal 'saddle'
+    (two pixels touching at a corner), two separate blobs and a hole."""
+    m = np.zeros((12, 14), bool)
+    m[1:4, 1:4] = True; m[3, 3] = True; m[4, 4] = True; m[4:7, 4:7] = True   # blob w/ saddle at (4,4)
+    m[8:11, 2:8] = True; m[9, 4:6] = False                                   # blob with a hole
+    m[1:3, 10:13] = True                                                     # third blob
+    coords, lens = livewire._trace_contours(m)
+    total = polygon_area(coords, lens)
+    print(f"  tracer: {len(lens)} loops, polygon area {total:.0f}, mask area {m.sum()}")
+    assert abs(total - m.sum()) < 1e-6, "polygons must reproduce the mask area"
+    assert len(lens) == 4, f"expected 4 loops (3 blobs + 1 hole), got {len(lens)}"
+    assert coords.min() >= 0 and coords[:, 0].max() <= 14 and coords[:, 1].max() <= 12
+
+
+def bench_auto_select_browser_resolution():
+    """Auto-select timing at the app's working resolution: graph build
+    (once per image), a flood (per seed change), a re-threshold (per
+    slider move). The browser (WASM) is roughly 2-3x slower."""
+    w, h = 768, 576
+    rng = np.random.default_rng(9)
+    base = ndimage_blur(rng.random((h, w, 3)).astype(np.float32) * 255)
+    rgb = np.clip(base, 0, 255).astype(np.uint8)
+    livewire.set_image(rgba_from_rgb(rgb), w, h)
+    t0 = time.perf_counter()
+    livewire._ensure_auto_graph()
+    t1 = time.perf_counter()
+    reach = livewire.auto_select([w // 2, h // 2], [])
+    t2 = time.perf_counter()
+    livewire.auto_mask(reach)
+    t3 = time.perf_counter()
+    livewire.auto_mask(max(1, reach - 5))
+    t4 = time.perf_counter()
+    print(f"  bench auto {w}x{h}: graph {t1 - t0:.2f}s | flood {t2 - t1:.2f}s | "
+          f"mask+contours {(t3 - t2) * 1000:.0f}ms | re-threshold {(t4 - t3) * 1000:.0f}ms")
+
+
 def ndimage_blur(a):
     from scipy import ndimage
-    return ndimage.gaussian_filter(a, 3.0)
+    sig = (3.0,) * a.ndim if a.ndim == 2 else (3.0, 3.0, 0.0)
+    return ndimage.gaussian_filter(a, sig)
 
 
 if __name__ == "__main__":
@@ -168,6 +363,18 @@ if __name__ == "__main__":
     test_trim_cutout_removes_background_and_specks()
     print("test_smooth_edges_rounds_jaggies_without_fringe")
     test_smooth_edges_rounds_jaggies_without_fringe()
+    print("test_auto_select_disk_single_click")
+    test_auto_select_disk_single_click()
+    print("test_auto_select_two_tone_object_needs_two_seeds")
+    test_auto_select_two_tone_object_needs_two_seeds()
+    print("test_auto_select_leak_is_stopped_by_negative_seed")
+    test_auto_select_leak_is_stopped_by_negative_seed()
+    print("test_auto_mask_contours_keep_holes_and_fill_specks")
+    test_auto_mask_contours_keep_holes_and_fill_specks()
+    print("test_trace_contours_handles_saddles_and_multiple_blobs")
+    test_trace_contours_handles_saddles_and_multiple_blobs()
     print("bench_browser_resolution")
     bench_browser_resolution()
+    print("bench_auto_select_browser_resolution")
+    bench_auto_select_browser_resolution()
     print("OK — all livewire tests passed")
