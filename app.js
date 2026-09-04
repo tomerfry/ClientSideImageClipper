@@ -10,7 +10,8 @@
  *   lasso  — anchors + snapped segments (one closed polygon)
  *   auto   — shift+click / shift+drag seeds -> engine returns the
  *            object's boundary loops (holes included); the `reach`
- *            slider re-thresholds the same flood instantly
+ *            slider re-thresholds the same flood instantly; `smart`
+ *            mode adds a colour+texture model on top of the edges
  * Both end up as `selectionPolygons()` (full-image px, even-odd fill).
  *
  * Coordinate spaces:
@@ -41,6 +42,7 @@ const els = {
   trim: $('btn-trim'), tol: $('tol'), tolVal: $('tol-val'),
   smooth: $('smooth'), smoothVal: $('smooth-val'),
   reach: $('reach'), reachVal: $('reach-val'), reachMode: $('reach-mode'),
+  autoMode: $('auto-mode'),
 };
 const ctx = els.canvas.getContext('2d');
 const reducedMotion = matchMedia('(prefers-reduced-motion: reduce)').matches;
@@ -249,6 +251,7 @@ function updateUi() {
   els.cut.disabled = !((state.anchors.length >= 2 || autoSel) && !state.closed);
   els.fit.disabled = !state.bitmap;
   els.reach.disabled = !state.imageReady;
+  els.autoMode.disabled = !state.imageReady;
   els.download.disabled = !state.cutout;
   els.copy.disabled = !state.cutout || typeof ClipboardItem === 'undefined';
   els.trim.disabled = !state.engineReady || (!state.cutout && !state.bitmap);
@@ -578,6 +581,7 @@ window.addEventListener('keydown', (e) => {
   }
   else if (e.key === '[') nudgeReach(-4);
   else if (e.key === ']') nudgeReach(4);
+  else if (e.key === 'm' || e.key === 'M') toggleAutoMode();
   else if (e.key === 'b' || e.key === 'B') requestTrim();
   else if (e.key === 's' || e.key === 'S') {
     if (Number(els.smooth.value) === 0) {
@@ -614,6 +618,7 @@ function newAuto() {
   return {
     seeds: [],          // [{x, y, sign, group}] work coords; a stroke shares one group
     group: 0,
+    mode: els.autoMode.value,  // 'smart' (edges + appearance model) or 'edges' (outline only)
     contours: [],       // [Float32Array x,y corner coords in work px], holes included
     area: 0,            // work px inside the selection
     reach: null,        // null until the engine's first suggestion arrives
@@ -686,7 +691,7 @@ function pumpAuto() {
     a.inFlight = true;
     showBusy('detecting object…');
     // reach: null on the very first request -> the engine picks one
-    worker.postMessage({ type: 'auto', pos, neg, reach: a.reach, gen: a.gen });
+    worker.postMessage({ type: 'auto', pos, neg, mode: a.mode, reach: a.reach, gen: a.gen });
   } else {
     a.inFlight = true;
     worker.postMessage({ type: 'autoReach', reach: p.reach, gen: a.gen });
@@ -710,7 +715,7 @@ function onAutoResult(m) {
   if (!state.closed) {
     const px = Math.round(a.area * state.wsx * state.wsy);
     setStatus('ready', a.area
-      ? `object: ~${px.toLocaleString()} px · reach ${a.reach}${a.manual ? '' : ' (auto)'} — shift+drag adds, shift+right-click subtracts, [ ] adjusts, enter cuts`
+      ? `object: ~${px.toLocaleString()} px · ${a.mode} · reach ${a.reach}${a.manual ? '' : ' (auto)'} — shift+drag adds, shift+right-click subtracts, [ ] reach, m mode, enter cuts`
       : 'nothing within reach — raise reach (]) or shift+click elsewhere');
   }
   updateUi();
@@ -805,6 +810,26 @@ function nudgeReach(delta) {
   if (recut) { state.auto.wasClosed = false; requestClose(); }
 }
 
+function setAutoMode(mode) {
+  els.autoMode.value = mode;
+  const a = state.auto;
+  if (!a || a.mode === mode) return;
+  a.mode = mode;
+  a.reach = null;           // the two modes' costs differ: let the engine re-pick the reach
+  a.manual = false;
+  setReachBadge();
+  const wasClosed = state.closed;
+  if (wasClosed) reopenSelection();
+  requestAuto({ seeds: true });
+  if (wasClosed) requestClose(); // re-cut once the new result is in
+}
+
+function toggleAutoMode() {
+  setAutoMode(els.autoMode.value === 'smart' ? 'edges' : 'smart');
+  if (!state.auto) setStatus('ready', `auto-select mode: ${els.autoMode.value} — shift+click an object`);
+}
+
+els.autoMode.addEventListener('change', () => setAutoMode(els.autoMode.value));
 els.reach.addEventListener('input', () => setReach(Number(els.reach.value)));
 els.reach.addEventListener('change', () => {
   const a = state.auto;

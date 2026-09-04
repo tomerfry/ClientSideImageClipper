@@ -326,6 +326,53 @@ def test_trace_contours_handles_saddles_and_multiple_blobs():
     assert coords.min() >= 0 and coords[:, 0].max() <= 14 and coords[:, 1].max() <= 12
 
 
+def test_auto_select_smart_mode_sees_past_texture_and_creases():
+    """Smart mode learns the object's appearance from the seeds, so
+    (1) a noisily textured disk on a differently coloured, equally
+    textured background is selected with one click at the auto reach,
+    and (2) a shaded disk cut into cells by dark creases is selected
+    whole from a short stroke — where "edges" mode has to stop at
+    every crease (its auto reach fills a single cell)."""
+    from scipy import ndimage
+    size = 320
+    yy, xx = np.mgrid[0:size, 0:size]
+    rng = np.random.default_rng(5)
+
+    disk = np.hypot(xx - 160, yy - 150) < 90
+    inside = np.array([70, 130, 80.0]) + rng.normal(0, 28, (size, size, 3))
+    outside = np.array([120, 100, 150.0]) + rng.normal(0, 28, (size, size, 3))
+    rgb = np.clip(np.where(disk[..., None], inside, outside), 0, 255).astype(np.uint8)
+    livewire.set_image(rgba_from_rgb(rgb), size, size)
+    reach = livewire.auto_select([160, 150], [], "smart")
+    smart = livewire.auto_mask_array(reach)
+    print(f"  textured disk: smart reach {reach}, IoU {iou(smart, disk):.3f}")
+    assert iou(smart, disk) > 0.9, "smart mode should select the whole textured disk"
+    assert reach < 60, f"texture should be cheap to cross in smart mode (reach {reach})"
+
+    disk2 = np.hypot(xx - 160, yy - 160) < 110
+    creases = ((xx % 40) < 3) | ((yy % 40) < 3)
+    shade = 1.0 - 0.5 * ((xx - 50) / 220.0)
+    rgb = np.where(disk2[..., None], np.array([40, 90, 200.0]) * shade[..., None], np.array([210, 215, 225.0]))
+    rgb[disk2 & creases] *= 0.35
+    rgb = np.clip(rgb + rng.normal(0, 2, rgb.shape), 0, 255).astype(np.uint8)
+    livewire.set_image(rgba_from_rgb(rgb), size, size)
+    stroke = [v for i in range(7) for v in (100 + i * 20, 160)]   # across 3-4 cells
+
+    reach_e = livewire.auto_select([160, 160], [], "edges")
+    cell = livewire.auto_mask_array(reach_e)
+    reach_s = livewire.auto_select(stroke, [], "smart")
+    whole = livewire.auto_mask_array(reach_s)
+    print(f"  creased disk: edges click -> reach {reach_e}, IoU {iou(cell, disk2):.3f} (one cell); "
+          f"smart stroke -> reach {reach_s}, IoU {iou(whole, disk2):.3f}")
+    assert iou(cell, disk2) < 0.3, "edges mode is expected to stop at the first crease"
+    assert iou(whole, disk2) > 0.9, "smart mode should fill the whole creased disk from a stroke"
+    assert (whole & ~disk2).sum() < 0.03 * disk2.sum(), "smart mode leaked into the background"
+
+    # the mode is part of the cache key: switching back must recompute
+    reach_e2 = livewire.auto_select(stroke, [], "edges")
+    assert livewire._auto_key == (tuple(map(float, stroke)), (), "edges")
+
+
 def bench_auto_select_browser_resolution():
     """Auto-select timing at the app's working resolution: graph build
     (once per image), a flood (per seed change), a re-threshold (per
@@ -338,13 +385,16 @@ def bench_auto_select_browser_resolution():
     t0 = time.perf_counter()
     livewire._ensure_auto_graph()
     t1 = time.perf_counter()
-    reach = livewire.auto_select([w // 2, h // 2], [])
+    reach = livewire.auto_select([w // 2, h // 2], [], "edges")
     t2 = time.perf_counter()
     livewire.auto_mask(reach)
     t3 = time.perf_counter()
     livewire.auto_mask(max(1, reach - 5))
     t4 = time.perf_counter()
-    print(f"  bench auto {w}x{h}: graph {t1 - t0:.2f}s | flood {t2 - t1:.2f}s | "
+    livewire.auto_select([w // 2, h // 2], [], "smart")
+    t5 = time.perf_counter()
+    print(f"  bench auto {w}x{h}: graph {t1 - t0:.2f}s | edge flood {t2 - t1:.2f}s | "
+          f"smart (edge flood + model + flood) {t5 - t4:.2f}s | "
           f"mask+contours {(t3 - t2) * 1000:.0f}ms | re-threshold {(t4 - t3) * 1000:.0f}ms")
 
 
@@ -373,6 +423,8 @@ if __name__ == "__main__":
     test_auto_mask_contours_keep_holes_and_fill_specks()
     print("test_trace_contours_handles_saddles_and_multiple_blobs")
     test_trace_contours_handles_saddles_and_multiple_blobs()
+    print("test_auto_select_smart_mode_sees_past_texture_and_creases")
+    test_auto_select_smart_mode_sees_past_texture_and_creases()
     print("bench_browser_resolution")
     bench_browser_resolution()
     print("bench_auto_select_browser_resolution")

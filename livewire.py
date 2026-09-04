@@ -54,6 +54,20 @@ _AUTO_FLOOR_LO = 2.5
 _AUTO_FLOOR_HI = 8.0
 _AUTO_REACH_MAX = 100     # the UI slider's range (contrast units, 0..255 scale)
 _AUTO_LIMIT = _AUTO_REACH_MAX + 5.0  # dijkstra gives up beyond this distance
+# "smart" mode: appearance model on top of the edges
+_AUTO_ITERS = 1           # model rounds after the edge-only flood (more = GrabCut-style runaway on similar colours)
+_AUTO_BINS = (8, 24, 24, 4)   # luma, chroma-b, chroma-r, texture level
+_AUTO_CHROMA_SPAN = 150.0 # chroma axes cover [-span, span] (finer bins tell pastels apart)
+_AUTO_TEX_EDGES = (3.0, 8.0, 20.0)  # texture-level bin edges (mean local gradient, contrast units)
+_AUTO_SPACE = "ycc"                 # colour axes: "ycc" (luma-difference chroma) or "chromaticity" (shading-invariant)
+_AUTO_CHROMATICITY_RANGE = (0.08, 0.6)  # r/(r+g+b), g/(r+g+b) range the chromaticity bins cover
+_AUTO_HIST_SIGMA = (1.2, 0.8, 0.8)  # histogram smoothing per (luma, chroma, chroma) axis, in bins (luma blurred: shading)
+_AUTO_SHARPEN = 2.0       # likelihood-ratio exponent: pushes P toward 0/1
+_AUTO_P_SIGMA = 1.5       # spatial smoothing of the probability map (px)
+_AUTO_TOLL = 0.6          # per-pixel cost of walking through background-like pixels
+_AUTO_P_SURE = 0.70       # P above this: raw edges are ignored (object interior)
+_AUTO_P_DOUBT = 0.50      # P below this: raw edges count in full
+_AUTO_RHO_WINDOW = 5      # edge discount judged on the min P in this window (px)
 
 # Engine state (one image at a time)
 _w = 0
@@ -62,10 +76,15 @@ _graph = None
 _pred = None
 _seed = -1
 _auto_grad = None         # colour-gradient magnitude map (contrast units)
-_auto_graph = None        # barrier-cost grid graph, built lazily on first use
-_auto_pos = None          # (seed key, distance map) for the positive seeds
-_auto_neg = None          # same for the negative seeds, or None
+_auto_bins = None         # per-pixel appearance bin (colour + texture), int32
+_auto_barrier = None      # soft-floored edge cost map (smart mode reuses it)
+_auto_grid = None         # (indptr, indices, step) of the 8-connected grid, built once
+_auto_graph = None        # edge-only barrier graph, built lazily on first use
+_auto_key = None          # (pos, neg, mode) the cached floods belong to
+_auto_pos = None          # distance map from the positive seeds
+_auto_neg = None          # distance map from the negative seeds, or None
 _auto_seed_idx = None     # flat indices of the snapped positive seed pixels
+_auto_prob = None         # last foreground-probability map (smart mode; for tooling)
 
 
 def _as_bytes_like(buf):
@@ -127,7 +146,8 @@ def set_image(rgba, width, height):
     """Ingest an RGBA byte buffer (width*height*4) and precompute the
     cost graph. Must be called before set_seed/get_path."""
     global _w, _h, _graph, _pred, _seed
-    global _auto_grad, _auto_graph, _auto_pos, _auto_neg, _auto_seed_idx
+    global _auto_grad, _auto_bins, _auto_barrier, _auto_grid, _auto_graph
+    global _auto_key, _auto_pos, _auto_neg, _auto_seed_idx, _auto_prob
     width = int(width)
     height = int(height)
     buf = np.frombuffer(_as_bytes_like(rgba), dtype=np.uint8)
@@ -152,10 +172,15 @@ def set_image(rgba, width, height):
     _pred = None
     _seed = -1
     _auto_grad = _contrast_map(px[..., :3])
+    _auto_bins = _appearance_bins(px[..., :3], _auto_grad)
+    _auto_barrier = None
+    _auto_grid = None
     _auto_graph = None
+    _auto_key = None
     _auto_pos = None
     _auto_neg = None
     _auto_seed_idx = None
+    _auto_prob = None
 
 
 def set_seed(x, y):
@@ -299,9 +324,23 @@ def smooth_edges(rgba, width, height, amount):
 # `reach` (the UI slider) is the contrast budget. Re-thresholding is
 # free, so adjusting the selection never re-runs Dijkstra.
 #
+# "smart" mode (default) adds an appearance model, GrabCut-style but
+# without the graph cut: the edge-only region seeds a foreground
+# colour+texture histogram, the rest of the image a background one, and
+# every pixel gets a foreground probability P. The flood is re-run on a
+# cost that charges raw edges only where the pixel does not look like
+# the object — so creases, shading and texture *inside* it are free —
+# and tolls every step through background-looking pixels, so a leak
+# through a gap in the outline runs out of budget. One round only: a
+# second round re-samples from the grown region and, like GrabCut on
+# similar colours, tends to run away. The flip side of trusting the
+# model is that two touching regions of the same appearance merge even
+# across a real edge; a negative seed (or "edges" mode) separates them.
+#
 # Negative seeds run a second flood; a pixel stays foreground only if it
 # is geodesically closer to a positive seed than to any negative one
-# (the GeoS rule), which lets a click push back a leaked region.
+# (the GeoS rule), which lets a click push back a leaked region. They
+# also feed the background model.
 
 
 def _contrast_map(rgb):
@@ -315,10 +354,38 @@ def _contrast_map(rgb):
     return (np.sqrt(acc) / (8.0 * np.sqrt(3.0))).astype(np.float32)
 
 
+def _appearance_bins(rgb, grad):
+    """Quantise every pixel into a (luma, chroma, chroma, texture) bin.
+    Texture = local gradient energy averaged over a few pixels, so a
+    leafy or woven surface is one appearance even though its colours
+    swing pixel to pixel."""
+    nl, nb, nr, nt = _AUTO_BINS
+    r, g, b = rgb[..., 0], rgb[..., 1], rgb[..., 2]
+    y = 0.299 * r + 0.587 * g + 0.114 * b
+    li = np.clip((y / 256.0 * nl).astype(np.int32), 0, nl - 1)
+    if _AUTO_SPACE == "chromaticity":
+        # r/(r+g+b), g/(r+g+b): invariant to shading, so a lit and a
+        # shadowed part of the same surface share a bin
+        ssum = r + g + b + 3.0
+        lo, hi = _AUTO_CHROMATICITY_RANGE
+        bi = np.clip(((r + 1.0) / ssum - lo) / (hi - lo) * nb, 0, nb - 1).astype(np.int32)
+        ri = np.clip(((g + 1.0) / ssum - lo) / (hi - lo) * nr, 0, nr - 1).astype(np.int32)
+    else:
+        cb = b - y
+        cr = r - y
+        span = float(_AUTO_CHROMA_SPAN)
+        bi = np.clip(((cb + span) / (2 * span) * nb).astype(np.int32), 0, nb - 1)
+        ri = np.clip(((cr + span) / (2 * span) * nr).astype(np.int32), 0, nr - 1)
+    tex = ndimage.gaussian_filter(grad, 3.0)
+    ti = np.digitize(tex, list(_AUTO_TEX_EDGES)[:nt - 1]).astype(np.int32)
+    return ((li * nb + bi) * nr + ri) * nt + ti
+
+
 def _ensure_auto_graph():
-    """Build the barrier graph on first use (it costs as much as the
-    livewire graph, so it's deferred until the user actually shift+clicks)."""
-    global _auto_graph
+    """Build the grid structure and the edge-only barrier graph on first
+    use (it costs as much as the livewire graph, so it's deferred until
+    the user actually shift+clicks)."""
+    global _auto_graph, _auto_grid, _auto_barrier
     if _auto_graph is not None:
         return
     if _auto_grad is None:
@@ -328,8 +395,19 @@ def _ensure_auto_graph():
     # so faint noise barely accumulates while wide soft edges keep most of
     # their contrast (a hard floor would let blurry outlines leak)
     floor = float(np.clip(_AUTO_FLOOR_K * np.median(g), _AUTO_FLOOR_LO, _AUTO_FLOOR_HI))
-    barrier = g * g / (g + floor)
-    _auto_graph = _build_graph((barrier + _AUTO_EPS).astype(np.float64))
+    _auto_barrier = (g * g / (g + floor)).astype(np.float64)
+    ones = _build_graph(np.ones((_h, _w), dtype=np.float64))
+    _auto_grid = (ones.indptr, ones.indices, ones.data)   # data = step length
+    _auto_graph = _graph_from_cost(_auto_barrier + _AUTO_EPS)
+
+
+def _graph_from_cost(cost):
+    """CSR grid graph with per-pixel entry cost, sharing the structure
+    built once per image (only the weights are recomputed)."""
+    indptr, indices, step = _auto_grid
+    data = step * cost.ravel()[indices]
+    n = _w * _h
+    return csr_matrix((data, indices, indptr), shape=(n, n))
 
 
 def auto_ready():
@@ -363,41 +441,107 @@ def _seed_pixels(flat):
     return np.array(seeds, dtype=np.int64), np.unique(np.array(sources, dtype=np.int64))
 
 
-def _flood(sources):
+def _flood(graph, sources):
     """Minimum crossing cost from any source pixel to every pixel
     (inf beyond _AUTO_LIMIT, which lets dijkstra stop early)."""
     d = dijkstra(
-        _auto_graph, directed=True, indices=sources,
+        graph, directed=True, indices=sources,
         min_only=True, limit=_AUTO_LIMIT,
     )
     return d.astype(np.float32).reshape(_h, _w)
 
 
-def auto_select(pos, neg):
+def _fg_probability(d_pos, d_neg, reach):
+    """Foreground probability per pixel from colour+texture histograms:
+    the current region (d_pos <= reach, softly beyond) is the foreground
+    sample, everything else — and anything the negative seeds reached —
+    the background sample. P = pF^k / (pF^k + pB^k), the likelihood ratio
+    sharpened so 'mostly object-coloured' reads as confidently object
+    even while the object still pollutes the background sample."""
+    r = max(float(reach), 1.0)
+    fin = np.isfinite(d_pos)
+    dp = np.where(fin, d_pos, np.inf)
+    # foreground sample: the region at `reach`, fading to nothing a
+    # quarter-reach beyond it (a longer tail would let a neighbouring
+    # object that is barely out of reach pollute the foreground model)
+    w_f = np.clip(1.0 - (dp - r) / (0.25 * r), 0.0, 1.0)
+    w_f[~fin] = 0.0
+    w_b = 1.0 - w_f
+    if d_neg is not None:
+        neg = np.isfinite(d_neg) & (d_neg <= r)
+        w_f[neg] = 0.0
+        w_b[neg] = 1.0
+    nb = int(np.prod(_AUTO_BINS))
+    flat = _auto_bins.ravel()
+    h_f = np.bincount(flat, weights=w_f.ravel(), minlength=nb).reshape(_AUTO_BINS)
+    h_b = np.bincount(flat, weights=w_b.ravel(), minlength=nb).reshape(_AUTO_BINS)
+    sig = tuple(_AUTO_HIST_SIGMA) + (0.0,)
+    h_f = ndimage.gaussian_filter(h_f, sig)
+    h_b = ndimage.gaussian_filter(h_b, sig)
+    h_f /= max(h_f.sum(), 1e-9)
+    h_b /= max(h_b.sum(), 1e-9)
+    eps = 1e-3 / nb
+    pf = (h_f + eps) ** _AUTO_SHARPEN
+    pb = (h_b + eps) ** _AUTO_SHARPEN
+    p_bins = pf / (pf + pb)
+    prob = p_bins.ravel()[flat].reshape(_h, _w).astype(np.float32)
+    return ndimage.gaussian_filter(prob, _AUTO_P_SIGMA)
+
+
+def _smart_cost(prob):
+    """Per-pixel entry cost combining the appearance model with the raw
+    edges: edges count in full where P says 'not the object', fade out
+    as P rises to _AUTO_P_SURE, and background-like pixels carry a
+    per-step toll. An uninformative model (P ~ 0.5 everywhere) reduces
+    to the edge-only cost."""
+    # an edge ramp straddles its boundary: judge it by the *least*
+    # object-like pixel nearby, so the whole ramp counts next to
+    # background while creases deep inside the object stay free
+    near = ndimage.minimum_filter(prob, size=_AUTO_RHO_WINDOW)
+    rho = np.clip((_AUTO_P_SURE - near) / (_AUTO_P_SURE - _AUTO_P_DOUBT), 0.0, 1.0)
+    bg = np.clip((_AUTO_P_DOUBT - prob) / _AUTO_P_DOUBT, 0.0, 1.0)
+    cost = rho * _auto_barrier + _AUTO_TOLL * bg + _AUTO_EPS
+    return cost.astype(np.float64)
+
+
+def auto_select(pos, neg, mode="smart"):
     """Register the seed clicks: `pos`/`neg` are flat [x0, y0, x1, y1, ...]
-    lists of work-pixel coordinates (negative seeds may be empty). Runs
-    the flood(s) only for the seed set that changed, then returns the
+    lists of work-pixel coordinates (negative seeds may be empty), `mode`
+    is "smart" (edges + appearance model) or "edges" (outline only).
+    Recomputes the floods when anything changed, then returns the
     suggested `reach` (see `_suggest_reach`). Call `auto_mask` next."""
-    global _auto_pos, _auto_neg, _auto_seed_idx
+    global _auto_key, _auto_pos, _auto_neg, _auto_seed_idx, _auto_prob
     _ensure_auto_graph()
     pos = _as_list(pos)
     neg = _as_list(neg)
+    mode = str(mode)
     if len(pos) < 2:
         raise ValueError("auto_select needs at least one positive seed")
-    pk, nk = tuple(pos), tuple(neg)
-    if _auto_pos is None or _auto_pos[0] != pk:
-        seed_idx, sources = _seed_pixels(pos)
-        _auto_pos = (pk, _flood(sources))
-        _auto_seed_idx = seed_idx
-    if len(neg) < 2:
-        _auto_neg = None
-    elif _auto_neg is None or _auto_neg[0] != nk:
-        _, sources = _seed_pixels(neg)
-        _auto_neg = (nk, _flood(sources))
-    return _suggest_reach()
+    key = (tuple(pos), tuple(neg), mode)
+    if _auto_key == key:
+        return _suggest_reach(_auto_pos, _auto_neg)
+    seed_idx, src_pos = _seed_pixels(pos)
+    src_neg = _seed_pixels(neg)[1] if len(neg) >= 2 else None
+    graph = _auto_graph
+    d_pos = _flood(graph, src_pos)
+    d_neg = _flood(graph, src_neg) if src_neg is not None else None
+    prob = None
+    if mode == "smart":
+        for _ in range(_AUTO_ITERS):
+            reach = _suggest_reach(d_pos, d_neg)
+            prob = _fg_probability(d_pos, d_neg, reach)
+            graph = _graph_from_cost(_smart_cost(prob))
+            d_pos = _flood(graph, src_pos)
+            d_neg = _flood(graph, src_neg) if src_neg is not None else None
+    _auto_key = key
+    _auto_pos = d_pos
+    _auto_neg = d_neg
+    _auto_seed_idx = seed_idx
+    _auto_prob = prob
+    return _suggest_reach(d_pos, d_neg)
 
 
-def _suggest_reach():
+def _suggest_reach(d_pos, d_neg):
     """Pick a reach automatically from the region-growth curve A(t) =
     #pixels with d <= t. While t sweeps the object's interior the area
     jumps; once the object is full it sits on a plateau until t exceeds
@@ -405,12 +549,11 @@ def _suggest_reach():
     return the middle of the first wide plateau (a plateau is where the
     boundary advances by well under a pixel per unit of reach), so a
     soft edge is cut through its middle. Falls back to 30."""
-    d = _auto_pos[1]
-    ok = np.isfinite(d)
-    if _auto_neg is not None:
-        ok &= d < _auto_neg[1]
-    vals = d[ok]
-    total = d.size
+    ok = np.isfinite(d_pos)
+    if d_neg is not None:
+        ok &= d_pos < d_neg
+    vals = d_pos[ok]
+    total = d_pos.size
     edges = np.arange(0, _AUTO_REACH_MAX + 2, dtype=np.float64)
     counts, _ = np.histogram(vals, bins=edges)
     area = np.cumsum(counts).astype(np.float64)       # area[t] ~ A(t)
@@ -541,10 +684,9 @@ def auto_mask_array(reach):
     """The cleaned boolean mask at `reach` (None before any seed)."""
     if _auto_pos is None:
         return None
-    d = _auto_pos[1]
-    fg = d <= float(reach)
+    fg = _auto_pos <= float(reach)
     if _auto_neg is not None:
-        fg &= d < _auto_neg[1]
+        fg &= _auto_pos < _auto_neg
     return _clean_mask(fg, _auto_seed_idx)
 
 

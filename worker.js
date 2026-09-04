@@ -5,7 +5,7 @@
  *   setImage  -> imageReady       (cost graph built)
  *   seed      -> seedReady        (Dijkstra tree computed for an anchor)
  *   path      -> path             (seed->cursor optimal path, Int32Array)
- *   auto      -> auto             (shift+click seeds -> object contours)
+ *   auto      -> auto             (shift+click seeds [+ mode] -> object contours)
  *   autoReach -> auto             (re-threshold the last flood at a new reach)
  *
  * Messages are handled strictly in order, so a `path` reply always
@@ -115,7 +115,7 @@ self.onmessage = (e) => {
     case 'auto':
       try {
         if (!livewire.auto_ready()) post({ type: 'busy', text: 'mapping colour edges (first auto-select on this image)…' });
-        const suggested = livewire.auto_select(m.pos, m.neg);
+        const suggested = livewire.auto_select(m.pos, m.neg, m.mode || 'smart');
         postAutoMask(m.gen, m.reach == null ? suggested : m.reach, suggested);
       } catch (err) {
         fail('auto', err);

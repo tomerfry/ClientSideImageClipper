@@ -167,6 +167,11 @@
   .tol-row label { min-width: 6.5ch; }
   .tol-row .val { color: var(--purple); min-width: 3ch; text-align: right; font-variant-numeric: tabular-nums; }
   .tol-row .mode { color: var(--green); font-size: .8em; min-width: 4ch; }
+  .tol-row select {
+    flex: 1; min-width: 0; font: inherit; font-size: .85rem; color: var(--fg-dim);
+    background: var(--bg-raised); border: 1px solid var(--line); border-radius: 7px; padding: .22rem .4rem;
+  }
+  .tol-row select:disabled { opacity: .38; }
   .panel-title .dim { color: var(--fg-dim); font-weight: 400; opacity: .8; }
   .hints { list-style: none; display: flex; flex-direction: column; gap: .45rem; color: var(--fg-dim); font-size: .85rem; }
   .hints li::before { content: "› "; color: var(--pink); }
@@ -242,6 +247,14 @@
       <span id="reach-val" class="val">30</span>
       <span id="reach-mode" class="mode"></span>
     </div>
+    <div class="tol-row">
+      <label for="auto-mode">detect</label>
+      <select id="auto-mode" disabled
+        title="smart: learns the object's colours + texture from your click and ignores creases, shading and texture inside it · edges: stop at the nearest outline only (M toggles)">
+        <option value="smart" selected>smart · edges + appearance</option>
+        <option value="edges">edges only</option>
+      </select>
+    </div>
 
     <div class="panel-title">// result</div>
     <div id="result-box">
@@ -277,6 +290,7 @@
       <li><b>click</b> again to pin the snapped segment</li>
       <li><kbd>alt</kbd>+click = straight segment (no snap)</li>
       <li><kbd>shift</kbd>+click / drag = <b>auto-select</b>: the object under the cursor is detected by flooding outward until a colour edge is hit (dijkstra on a contrast-cost grid); paint across a multi-part object to cover it</li>
+      <li><b>detect: smart</b> (default) also learns the object's colours + texture from your seeds, so creases, shading and texture <em>inside</em> it are crossed freely while its appearance boundary still stops the flood — great for foliage, fabric, shaded 3-d shapes; <b>edges only</b> stops at the nearest outline (<kbd>m</kbd> toggles). If two same-looking regions merge, shift+right-click the unwanted one</li>
       <li><kbd>shift</kbd>+right-click / <kbd>shift</kbd>+<kbd>alt</kbd>+click = subtract a region that leaked in</li>
       <li><b>reach</b> slider or <kbd>[</kbd> <kbd>]</kbd> = grow / shrink the auto-selection (auto-picked first)</li>
       <li><b>double-click</b> / <kbd>enter</kbd> / click the first anchor = close &amp; cut</li>
@@ -293,7 +307,7 @@
   <span id="status-text">booting python engine…</span>
   <span id="img-info"></span>
   <span class="spacer"></span>
-  <span class="keys">click add · shift+click auto-select · [ ] reach · dblclick close · alt straight · b trim · s smooth · ⌫ undo · esc reset · wheel zoom · space+drag pan</span>
+  <span class="keys">click add · shift+click auto-select · [ ] reach · m mode · dblclick close · alt straight · b trim · s smooth · ⌫ undo · esc reset · wheel zoom · space+drag pan</span>
 </footer>
 
 <input type="file" id="file-input" accept="image/*" hidden>
