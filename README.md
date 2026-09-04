@@ -13,12 +13,18 @@ WebAssembly). No server, no uploads: a static site deployable to GitHub Pages.
    livewire, the algorithm behind Photoshop's Magnetic Lasso).
 3. **Auto-select** — `Shift`+click an object and its boundary is
    detected for you: a flood spreads out from the click and stops
-   wherever it would have to cross a colour edge. `Shift`+drag paints a
-   stroke of seeds (do this across multi-part objects: each fold, petal
-   or panel you touch gets filled to *its* edges), `Shift`+right-click
-   (or `Shift`+`Alt`+click) subtracts a region that leaked in, and the
-   **reach** slider / `[` `]` keys grow or shrink the result — the first
-   click picks a reach automatically. Holes are kept.
+   wherever it would have to cross a colour edge. In the default
+   **smart** mode the engine also learns the object's colours and
+   texture from your seeds, so creases, shading and texture *inside*
+   the object are crossed freely while its appearance boundary still
+   stops the flood (foliage, fabric, shaded 3-d shapes come out whole);
+   **edges only** stops at the nearest outline (`M` toggles).
+   `Shift`+drag paints a stroke of seeds (do this across multi-part or
+   heavily shaded objects: the model generalises from what you touch),
+   `Shift`+right-click (or `Shift`+`Alt`+click) subtracts a region that
+   leaked in or merged, and the **reach** slider / `[` `]` keys grow or
+   shrink the result — the first click picks a reach automatically.
+   Holes are kept.
 4. **Cut** — close the path (double-click / `Enter` / click the first
    anchor) or press `Enter` on an auto-selection to get an antialiased,
    transparent-background PNG you can download or copy straight to the
@@ -73,6 +79,23 @@ same grid, with the costs turned inside out:
 - Negative seeds run a second flood; a pixel stays selected only if it
   is geodesically closer to a positive seed than to a negative one
   (the GeoS rule), which lets one click push back a leak.
+- **Smart mode** adds an appearance model on top, GrabCut-style but
+  without the graph cut (scipy's max-flow is far too slow for a
+  960-px grid): the edge-only region seeds a foreground histogram over
+  (luma, chroma, chroma, texture level), the rest of the image — and
+  whatever the negative seeds reached — a background one, and each
+  pixel gets a sharpened likelihood-ratio probability *P* of being the
+  object. The flood re-runs on a cost where raw edges count in full
+  only where the neighbourhood is not confidently object-like, fade
+  out inside it, and every step through background-looking pixels
+  pays a toll. So an outline still stops the region wherever the
+  appearance changes, but creases, shading and texture inside the
+  object no longer do. A single model round is used on purpose:
+  re-sampling from the grown region runs away on similar colours,
+  exactly like iterated GrabCut. Its known failure mode is the mirror
+  image of edge mode's: two touching regions of the same appearance
+  merge across a real edge — a negative seed (which also feeds the
+  background model) or edges mode separates them.
 - The mask is tidied (seed-connected components, 1-px cracks closed,
   small holes filled) and turned into **pixel-corner polygons** by a
   vectorised crack-following tracer — holes come out as their own
@@ -80,8 +103,10 @@ same grid, with the costs turned inside out:
   polygon pipeline (Chaikin smoothing, antialiased canvas fill) does the
   cut at full resolution.
 
-Works best on objects with a visible outline; strongly textured
-subjects (foliage, fabric weave) accumulate cost and need the lasso.
+Edges mode works best on objects with a visible outline and stops at
+every crease; smart mode is the one to use for textured, shaded or
+multi-part subjects — a short stroke across the parts you want gives
+the model a representative sample.
 
 The engine runs in a Web Worker so the UI never blocks; images are
 processed at a max working resolution of 960 px (path coordinates are
@@ -95,6 +120,7 @@ mapped back to full resolution for the final cut).
 | straight (non-snapping) segment | `Alt` + click |
 | auto-select the object under the cursor | `Shift` + click, `Shift` + drag to paint seeds |
 | subtract from the auto-selection | `Shift` + right-click / `Shift` + `Alt` + click |
+| auto-select mode: smart ↔ edges only | *detect* select or `M` |
 | grow / shrink the auto-selection | *reach* slider or `[` / `]` |
 | close path & cut | double-click / `Enter` / click first anchor |
 | auto-trim leftover background | `B` or *trim bg* button |
