@@ -48,7 +48,6 @@ _W_BASE = 0.10
 # Auto-select tuning
 _AUTO_SIGMA = 1.2         # pre-blur before the colour gradient (texture vs. precision)
 _AUTO_EPS = 0.01          # per-pixel length cost: keeps weights > 0, bounds floods
-_AUTO_SNAP = 3            # a click snaps to the flattest pixel within this radius
 _AUTO_FLOOR_K = 2.0       # soft noise floor = clip(K * median gradient, LO, HI)
 _AUTO_FLOOR_LO = 2.5
 _AUTO_FLOOR_HI = 8.0
@@ -85,6 +84,7 @@ _auto_pos = None          # distance map from the positive seeds
 _auto_neg = None          # distance map from the negative seeds, or None
 _auto_seed_idx = None     # flat indices of the snapped positive seed pixels
 _auto_prob = None         # last foreground-probability map (smart mode; for tooling)
+_auto_valid = None        # visible pixels; hidden RGB must not guide segmentation
 
 
 def _as_bytes_like(buf):
@@ -148,10 +148,12 @@ def set_image(rgba, width, height):
     global _w, _h, _graph, _pred, _seed
     global _auto_grad, _auto_bins, _auto_barrier, _auto_grid, _auto_graph
     global _auto_key, _auto_pos, _auto_neg, _auto_seed_idx, _auto_prob
+    global _auto_valid
     width = int(width)
     height = int(height)
     buf = np.frombuffer(_as_bytes_like(rgba), dtype=np.uint8)
     px = buf.reshape(height, width, 4).astype(np.float32)
+    _auto_valid = px[..., 3] > 0
     gray = (0.2126 * px[..., 0] + 0.7152 * px[..., 1] + 0.0722 * px[..., 2]) / 255.0
 
     smooth = ndimage.gaussian_filter(gray, 1.0)
@@ -171,6 +173,13 @@ def set_image(rgba, width, height):
     _graph = _build_graph(cost)
     _pred = None
     _seed = -1
+    # Ignore hidden RGB in auto-selection. Extend visible colours before
+    # filtering to avoid a false dark/coloured rim; alpha bounds the flood.
+    if _auto_valid.any() and not _auto_valid.all():
+        nearest = ndimage.distance_transform_edt(
+            ~_auto_valid, return_distances=False, return_indices=True
+        )
+        px[..., :3] = px[..., :3][nearest[0], nearest[1]]
     _auto_grad = _contrast_map(px[..., :3])
     _auto_bins = _appearance_bins(px[..., :3], _auto_grad)
     _auto_barrier = None
@@ -406,6 +415,7 @@ def _graph_from_cost(cost):
     built once per image (only the weights are recomputed)."""
     indptr, indices, step = _auto_grid
     data = step * cost.ravel()[indices]
+    data[~_auto_valid.ravel()[indices]] = np.inf
     n = _w * _h
     return csr_matrix((data, indices, indptr), shape=(n, n))
 
@@ -417,28 +427,16 @@ def auto_ready():
 
 
 def _seed_pixels(flat):
-    """Snap each clicked (x, y) to the flattest nearby pixel (so a click
-    that lands on an outline still starts inside the object) and return
-    (snapped flat indices, flat indices of their 3x3 source disks)."""
-    seeds, sources = [], []
+    """Use the clicked pixels exactly: snapping and source disks can
+    cross a narrow object or seed the background across its boundary."""
+    seeds = []
     for i in range(0, len(flat) - 1, 2):
         x = min(max(int(flat[i]), 0), _w - 1)
         y = min(max(int(flat[i + 1]), 0), _h - 1)
-        r = _AUTO_SNAP
-        y0, y1 = max(0, y - r), min(_h, y + r + 1)
-        x0, x1 = max(0, x - r), min(_w, x + r + 1)
-        win = _auto_grad[y0:y1, x0:x1]
-        yy, xx = np.mgrid[y0:y1, x0:x1]
-        score = win + 0.5 * np.hypot(yy - y, xx - x)  # prefer close *and* flat
-        k = int(np.argmin(score))
-        sy, sx = y0 + k // win.shape[1], x0 + k % win.shape[1]
-        seeds.append(sy * _w + sx)
-        for dy in (-1, 0, 1):
-            for dx in (-1, 0, 1):
-                py, px_ = sy + dy, sx + dx
-                if 0 <= py < _h and 0 <= px_ < _w:
-                    sources.append(py * _w + px_)
-    return np.array(seeds, dtype=np.int64), np.unique(np.array(sources, dtype=np.int64))
+        if _auto_valid[y, x]:
+            seeds.append(y * _w + x)
+    seeds = np.unique(np.array(seeds, dtype=np.int64))
+    return seeds, seeds
 
 
 def _flood(graph, sources):
@@ -468,9 +466,11 @@ def _fg_probability(d_pos, d_neg, reach):
     w_f[~fin] = 0.0
     w_b = 1.0 - w_f
     if d_neg is not None:
-        neg = np.isfinite(d_neg) & (d_neg <= r)
+        neg = np.isfinite(d_neg) & (d_neg <= r) & (d_neg <= d_pos)
         w_f[neg] = 0.0
         w_b[neg] = 1.0
+    w_f[~_auto_valid] = 0.0
+    w_b[~_auto_valid] = 0.0
     nb = int(np.prod(_AUTO_BINS))
     flat = _auto_bins.ravel()
     h_f = np.bincount(flat, weights=w_f.ravel(), minlength=nb).reshape(_AUTO_BINS)
@@ -522,6 +522,10 @@ def auto_select(pos, neg, mode="smart"):
         return _suggest_reach(_auto_pos, _auto_neg)
     seed_idx, src_pos = _seed_pixels(pos)
     src_neg = _seed_pixels(neg)[1] if len(neg) >= 2 else None
+    if src_pos.size == 0:
+        raise ValueError("Place a positive seed on a visible part of the image")
+    if src_neg is not None and src_neg.size == 0:
+        src_neg = None
     graph = _auto_graph
     d_pos = _flood(graph, src_pos)
     d_neg = _flood(graph, src_neg) if src_neg is not None else None
@@ -581,7 +585,7 @@ def _suggest_reach(d_pos, d_neg):
     return int(round(a + 0.5 * (b - a)))
 
 
-def _clean_mask(fg, seeds):
+def _clean_mask(fg, seeds, allowed=None):
     """Keep only the components that contain a positive seed, close
     1-px cracks, and fill holes that are tiny relative to the region."""
     eight = np.ones((3, 3), dtype=bool)
@@ -607,6 +611,15 @@ def _clean_mask(fg, seeds):
         small = sizes < max(24, 0.02 * fg.sum())
         small[0] = False
         fg = fg | small[hl]
+    if allowed is not None:
+        fg &= allowed
+        # Constraints can split a region after closing/filling. Do not
+        # leave behind islands disconnected from every positive seed.
+        lab, n = ndimage.label(fg, structure=eight)
+        keep = np.unique(lab.ravel()[seeds])
+        lut = np.zeros(n + 1, dtype=bool)
+        lut[keep[keep > 0]] = True
+        fg = lut[lab]
     return fg
 
 
@@ -684,10 +697,11 @@ def auto_mask_array(reach):
     """The cleaned boolean mask at `reach` (None before any seed)."""
     if _auto_pos is None:
         return None
-    fg = _auto_pos <= float(reach)
+    allowed = _auto_valid.copy()
     if _auto_neg is not None:
-        fg &= _auto_pos < _auto_neg
-    return _clean_mask(fg, _auto_seed_idx)
+        allowed &= _auto_pos < _auto_neg
+    fg = (_auto_pos <= float(reach)) & allowed
+    return _clean_mask(fg, _auto_seed_idx, allowed)
 
 
 def get_path(x, y):

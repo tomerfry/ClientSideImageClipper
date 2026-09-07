@@ -46,6 +46,18 @@ WebAssembly). No server, no uploads: a static site deployable to GitHub Pages.
 
 ## How the "magic" works
 
+Selection uses your exact clicked pixels, including on narrow details.
+Automatic reach is recalculated when seeds change until you adjust the
+reach slider manually. Negative-seed exclusions survive mask cleanup.
+Fully transparent pixels cannot join a selection, and their hidden RGB
+values do not influence the appearance model; transparent holes remain holes.
+
+This is interactive colour/edge segmentation, not semantic object
+recognition. Similar-looking touching objects can still require negative
+seeds, and fine details smaller than the working resolution can be lost.
+The tests cover synthetic outlines, texture, shading, leaks, precise seeds,
+and transparency; they do not establish accuracy on arbitrary photographs.
+
 `livewire.py` (Mortensen & Barrett, *Intelligent Scissors for Image
 Composition*, SIGGRAPH '95):
 
