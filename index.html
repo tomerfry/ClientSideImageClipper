@@ -25,6 +25,24 @@
     --mono: "Cascadia Code", "Fira Code", Consolas, "JetBrains Mono", monospace;
   }
   * { box-sizing: border-box; margin: 0; padding: 0; }
+  [hidden] { display: none !important; }
+  .tabs { display: flex; gap: .4rem; padding: .5rem .9rem; border-bottom: 1px solid var(--line); }
+  .tabs [aria-selected="true"] { color: var(--green); border-color: var(--green); }
+  #compose-panel { flex: 1; min-height: 0; display: flex; }
+  #compose-stage { flex: 1; min-width: 0; position: relative; overflow: hidden; }
+  #compose-view { width: 100%; height: 100%; position: absolute; touch-action: none; outline-offset: -3px; }
+  #compose-sidebar { width: 280px; padding: 1rem; background: var(--bg-alt); border-left: 1px solid var(--line); overflow: auto; display: flex; flex-direction: column; gap: .8rem; }
+  #compose-sidebar input { width: 78px; padding: .3rem; color: var(--fg); background: var(--bg); border: 1px solid var(--line); border-radius: 4px; font: inherit; }
+  #compose-layers { display: flex; flex-direction: column; gap: .4rem; }
+  #compose-layers button { text-align: left; overflow-wrap: anywhere; }
+  #compose-layers [aria-pressed="true"] { border-color: var(--blue); color: var(--blue); }
+  .compose-help { color: var(--fg-dim); font-size: 12px; line-height: 1.6; }
+  #compose-message { color: var(--green); min-height: 2.5em; }
+  @media (max-width: 700px) {
+    .brand .sub { display: none; }
+    header { flex-wrap: wrap; }
+    #compose-sidebar { width: 190px; padding: .6rem; }
+  }
   html, body { height: 100%; overflow: hidden; }
   body {
     background: var(--bg);
@@ -208,7 +226,7 @@
   <div class="brand"><span class="tok">›</span> magic-clipper
     <span class="sub">// magnetic lasso · python-in-browser (pyodide + numpy/scipy)</span>
   </div>
-  <div class="actions">
+  <div class="actions" id="clip-actions">
     <button id="btn-open" title="Open an image file (O)">open</button>
     <button id="btn-paste" title="Paste image from clipboard (Ctrl+V)">paste</button>
     <span class="sep"></span>
@@ -220,7 +238,11 @@
   </div>
 </header>
 
-<main>
+<nav class="tabs" role="tablist" aria-label="Workspace">
+  <button id="tab-clip" role="tab" aria-selected="true" aria-controls="clip-panel">clip image</button>
+  <button id="tab-compose" role="tab" aria-selected="false" aria-controls="compose-panel" tabindex="-1">canvas</button>
+</nav>
+<main id="clip-panel" role="tabpanel" aria-labelledby="tab-clip">
   <div id="stage">
     <canvas id="canvas"></canvas>
 
@@ -282,6 +304,7 @@
       <button id="btn-copy" disabled>copy</button>
     </div>
     <div id="result-meta"></div>
+    <button id="btn-add-canvas" class="good" disabled>add to canvas</button>
 
     <div class="panel-title">// how it works</div>
     <ul class="hints">
@@ -302,6 +325,30 @@
   </aside>
 </main>
 
+<section id="compose-panel" role="tabpanel" aria-labelledby="tab-compose" hidden>
+  <div id="compose-stage">
+    <canvas id="compose-view" tabindex="0" aria-label="Composition. Select and drag images; drag corner handles to resize. Arrow keys move the selected layer."></canvas>
+  </div>
+  <aside id="compose-sidebar">
+    <div class="panel-title">// canvas size</div>
+    <form id="compose-size">
+      <label>W <input id="compose-width" type="number" min="1" max="4096" value="1200" required aria-label="Canvas width"></label>
+      <label>H <input id="compose-height" type="number" min="1" max="4096" value="800" required aria-label="Canvas height"></label>
+      <button type="submit">apply size</button>
+    </form>
+    <button id="compose-import">add image files</button>
+    <input id="compose-files" type="file" accept="image/*" multiple hidden>
+    <div class="row"><button id="compose-undo" disabled>undo</button><button id="compose-export" class="good" disabled>export png</button></div>
+    <div class="panel-title">// layers · top first</div>
+    <div id="compose-layers"></div>
+    <div class="row"><button id="compose-front" disabled>to front</button><button id="compose-back" disabled>to back</button></div>
+    <div class="row"><button id="compose-duplicate" disabled>duplicate</button><button id="compose-remove" disabled>remove</button></div>
+    <p class="compose-help">Clip an image, then choose “add to canvas”. Repeat with other cuts or source images. Drag to move; drag a corner to resize proportionally. Arrow keys move 1 px; Shift moves 10 px. Delete removes a layer.</p>
+    <p class="compose-help">Drop or paste images here too. The checkerboard exports as transparency. Your layout stays while switching tabs; export before reloading.</p>
+    <p id="compose-message" role="status" aria-live="polite"></p>
+  </aside>
+</section>
+
 <footer>
   <span id="dot"></span>
   <span id="status-text">booting python engine…</span>
@@ -311,6 +358,7 @@
 </footer>
 
 <input type="file" id="file-input" accept="image/*" hidden>
+<script src="composer.js"></script>
 <script src="app.js"></script>
 </body>
 </html>

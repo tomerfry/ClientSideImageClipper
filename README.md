@@ -126,6 +126,27 @@ mapped back to full resolution for the final cut).
 
 ## Controls
 
+### Composition canvas
+
+After making a cut, click **add to canvas** beside the result. The **canvas**
+tab holds independent copies of your cutouts, so you can return to **clip
+image**, open another source, and add more pieces without losing the layout.
+You can also import multiple image files, drop them, or paste an image into
+the canvas tab.
+
+Drag an image to move it and drag a corner handle to resize proportionally.
+The layer list selects overlapping images; **to front**, **to back**,
+**duplicate**, and **remove** manage their stacking. Arrow keys move the
+selected image (Shift for 10 pixels), Delete removes it, and **undo** or
+Ctrl/Cmd+Z restores the previous change (up to 40 changes).
+
+Set the canvas width and height (up to 4096 pixels each) and use **export
+png** to download the composition with transparency. Content outside the
+canvas bounds is clipped. Layouts remain in memory while switching tabs
+and source images, but do not survive a page reload; export before leaving.
+
+Canvas interaction checks: `node tests/test_composer.cjs`.
+
 | action | input |
 |---|---|
 | add snapping anchor | click |

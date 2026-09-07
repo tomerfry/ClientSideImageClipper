@@ -253,6 +253,7 @@ function updateUi() {
   els.reach.disabled = !state.imageReady;
   els.autoMode.disabled = !state.imageReady;
   els.download.disabled = !state.cutout;
+  $('btn-add-canvas').disabled = !state.cutout;
   els.copy.disabled = !state.cutout || typeof ClipboardItem === 'undefined';
   els.trim.disabled = !state.engineReady || (!state.cutout && !state.bitmap);
 }
@@ -332,6 +333,7 @@ els.fileInput.addEventListener('change', () => {
 });
 
 window.addEventListener('paste', (e) => {
+  if (window.clipperCanvas.active) return;
   for (const item of e.clipboardData?.items || []) {
     if (item.type.startsWith('image/')) {
       e.preventDefault();
@@ -355,6 +357,7 @@ els.paste.addEventListener('click', async () => {
 
 ['dragover', 'dragenter'].forEach((ev) =>
   window.addEventListener(ev, (e) => {
+    if (window.clipperCanvas.active) return;
     e.preventDefault();
     els.dropzone.classList.remove('hidden');
     els.dropzone.classList.add('armed');
@@ -366,6 +369,7 @@ window.addEventListener('dragleave', (e) => {
   if (state.bitmap) els.dropzone.classList.add('hidden');
 });
 window.addEventListener('drop', (e) => {
+  if (window.clipperCanvas.active) return;
   e.preventDefault();
   els.dropzone.classList.remove('armed');
   if (state.bitmap) els.dropzone.classList.add('hidden');
@@ -568,6 +572,7 @@ els.cut.addEventListener('click', requestClose);
 els.fit.addEventListener('click', fitView);
 
 window.addEventListener('keydown', (e) => {
+  if (window.clipperCanvas.active) return;
   const tag = e.target && e.target.tagName;
   if (tag === 'BUTTON' || tag === 'INPUT') return; // let native control keys work
   if (e.code === 'Space') {
@@ -1085,6 +1090,7 @@ function publishCutout(canvas, opts) {
     if (!blob) return;
     if (state.cutout) URL.revokeObjectURL(state.cutout.url);
     state.cutout = {
+      canvas,
       blob, url: URL.createObjectURL(blob),
       w: canvas.width, h: canvas.height,
       srcCanvas: opts.srcCanvas,    // original cut — trims re-derive from it
@@ -1208,6 +1214,10 @@ els.download.addEventListener('click', () => {
   a.href = state.cutout.url;
   a.download = `magic-clip-${state.cutout.w}x${state.cutout.h}.png`;
   a.click();
+});
+
+$('btn-add-canvas').addEventListener('click', () => {
+  if (state.cutout) window.clipperCanvas.add(state.cutout.canvas);
 });
 
 els.copy.addEventListener('click', async () => {

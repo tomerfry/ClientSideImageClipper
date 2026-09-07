@@ -34,6 +34,12 @@ jobs:
         with:
           enablement: true
 
+      - name: Check canvas interactions and JavaScript syntax
+        run: |
+          node --check app.js
+          node --check composer.js
+          node tests/test_composer.cjs
+
       - name: Upload site
         uses: actions/upload-pages-artifact@v3
         with:
