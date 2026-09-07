@@ -690,8 +690,9 @@ function pumpAuto() {
     if (!pos.length) { a.contours = []; a.area = 0; invalidateSelection(); requestRender(); return; }
     a.inFlight = true;
     showBusy('detecting object…');
-    // reach: null on the very first request -> the engine picks one
-    worker.postMessage({ type: 'auto', pos, neg, mode: a.mode, reach: a.reach, gen: a.gen });
+    // New seeds change the model and its cost scale. Re-estimate reach
+    // until the user explicitly takes control with the slider.
+    worker.postMessage({ type: 'auto', pos, neg, mode: a.mode, reach: a.manual ? a.reach : null, gen: a.gen });
   } else {
     a.inFlight = true;
     worker.postMessage({ type: 'autoReach', reach: p.reach, gen: a.gen });

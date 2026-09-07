@@ -373,6 +373,66 @@ def test_auto_select_smart_mode_sees_past_texture_and_creases():
     assert livewire._auto_key == (tuple(map(float, stroke)), (), "edges")
 
 
+def test_auto_select_respects_exact_clicks():
+    """A seed on a thin stripe must not snap into its background."""
+    rgb = np.full((40, 40, 3), 230, np.uint8)
+    rgb[:, 20] = (25, 80, 140)
+    livewire.set_image(rgba_from_rgb(rgb), 40, 40)
+    for mode in ("edges", "smart"):
+        livewire.auto_select([20, 20], [], mode)
+        mask = livewire.auto_mask_array(0)
+        assert mask[20, 20], "the actual clicked pixel must be selected"
+        assert mask.sum() == 1, "a source disk must not seed neighbouring background"
+
+
+def test_auto_select_preserves_explicit_exclusion():
+    """Cleanup must not refill a small hole explicitly marked negative."""
+    yy, xx = np.mgrid[:160, :160]
+    disk = np.hypot(xx - 80, yy - 80) < 55
+    hole = np.hypot(xx - 80, yy - 80) < 3
+    rgb = np.where((disk & ~hole)[..., None],
+                   np.array([200, 80, 40], np.uint8),
+                   np.array([30, 30, 35], np.uint8))
+    livewire.set_image(rgba_from_rgb(rgb), 160, 160)
+    for mode in ("edges", "smart"):
+        reach = livewire.auto_select([55, 80], [80, 80], mode)
+        for budget in (reach, 100):
+            mask = livewire.auto_mask_array(budget)
+            excluded = livewire._auto_neg <= livewire._auto_pos
+            assert not mask[80, 80], "negative seed was filled by cleanup"
+            assert not (mask & excluded).any(), "cleanup violated negative flood"
+            assert mask[80, 55], "positive seed must survive"
+
+
+def test_auto_select_ignores_hidden_rgb_and_preserves_alpha_holes():
+    """Hidden RGB cannot affect selection or bridge transparent gaps."""
+    yy, xx = np.mgrid[:100, :100]
+    visible = np.hypot(xx - 50, yy - 50) < 35
+    visible[49:52, 49:52] = False  # small enough for ordinary hole filling
+    visible[:, 52] = False        # separate two same-colour components
+    expected, _ = livewire.ndimage.label(visible, structure=np.ones((3, 3)))
+    expected = expected == expected[50, 35]
+    previous = {}
+    for hidden in (0, 255):
+        rgba = np.full((100, 100, 4), hidden, np.uint8)
+        rgba[visible, :3] = (50, 140, 90)
+        rgba[..., 3] = visible * 255
+        livewire.set_image(rgba.tobytes(), 100, 100)
+        for mode in ("edges", "smart"):
+            reach = livewire.auto_select([35, 50], [], mode)
+            mask = livewire.auto_mask_array(reach)
+            assert np.array_equal(mask, expected), "alpha boundary or hole was lost"
+            if mode in previous:
+                assert np.array_equal(mask, previous[mode]), "hidden RGB changed selection"
+            previous[mode] = mask
+        try:
+            livewire.auto_select([0, 0], [])
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("a transparent click should request a visible seed")
+
+
 def bench_auto_select_browser_resolution():
     """Auto-select timing at the app's working resolution: graph build
     (once per image), a flood (per seed change), a re-threshold (per
@@ -425,6 +485,12 @@ if __name__ == "__main__":
     test_trace_contours_handles_saddles_and_multiple_blobs()
     print("test_auto_select_smart_mode_sees_past_texture_and_creases")
     test_auto_select_smart_mode_sees_past_texture_and_creases()
+    print("test_auto_select_respects_exact_clicks")
+    test_auto_select_respects_exact_clicks()
+    print("test_auto_select_preserves_explicit_exclusion")
+    test_auto_select_preserves_explicit_exclusion()
+    print("test_auto_select_ignores_hidden_rgb_and_preserves_alpha_holes")
+    test_auto_select_ignores_hidden_rgb_and_preserves_alpha_holes()
     print("bench_browser_resolution")
     bench_browser_resolution()
     print("bench_auto_select_browser_resolution")
